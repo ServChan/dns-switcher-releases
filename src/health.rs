@@ -120,18 +120,18 @@ impl Health {
         match self.grade() {
             Grade::Good => None,
             Grade::Dead => Some(format!(
-                "не отвечает ({})",
+                "не отвечает: {}",
                 self.ips.iter().find_map(|h| h.result.as_ref().err()).map(String::as_str).unwrap_or("нет ответа")
             )),
-            Grade::Slow => Some(format!("отвечает слишком медленно ({})", seconds(self.best_ms().unwrap_or(0)))),
+            Grade::Slow => Some(format!("отвечает слишком медленно: DNS {}", seconds(self.best_ms().unwrap_or(0)))),
             Grade::ServiceDown => {
                 let down: Vec<String> = self
                     .services
                     .iter()
                     .filter(|s| !s.works())
-                    .map(|s| format!("{} не открывается ({})", s.name, s.first_error().unwrap_or("нет ответа")))
+                    .map(|s| format!("{} не открывается: {}", s.name, s.first_error().unwrap_or("нет ответа")))
                     .collect();
-                Some(down.join(", "))
+                Some(down.join("; "))
             }
             Grade::PartialProxies => {
                 let partial: Vec<String> = self
@@ -140,8 +140,22 @@ impl Health {
                     .filter(|s| !s.fully())
                     .map(|s| format!("{}: работает {} из {} прокси", s.name, s.ok_count(), s.proxies.len()))
                     .collect();
-                Some(partial.join(", "))
+                Some(partial.join("; "))
             }
+        }
+    }
+
+    /// Состояние одной строкой для журнала: что работает или что не так.
+    pub fn summary(&self) -> String {
+        if let Some(problem) = self.problem() {
+            return problem;
+        }
+        let dns = seconds(self.best_ms().unwrap_or(0));
+        if self.services.is_empty() {
+            format!("работает, DNS {dns}")
+        } else {
+            let names: Vec<&str> = self.services.iter().map(|s| s.name).collect();
+            format!("работает: {} открываются, DNS {dns}", names.join(" и "))
         }
     }
 }

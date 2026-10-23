@@ -196,7 +196,7 @@ impl Watcher {
         let reason = health.problem().unwrap_or_default();
         if self.fail_streak < FAILS_TO_SWITCH {
             state::log(&format!(
-                "«{}»: {reason}. Перепроверю через {} с.",
+                "«{}» — {reason}. Перепроверю через {} с.",
                 active.name, cfg.failover.interval_secs
             ));
             return;
@@ -204,21 +204,25 @@ impl Watcher {
 
         // Ищем замену строго лучше текущего: сначала в той же группе, по порядку списка.
         let (same, fallback) = candidates(cfg, &active);
-        if let Some((s, h)) = best(&check_all(cfg, &same), grade) {
+        let checked = check_all(cfg, &same);
+        if let Some((s, h)) = best(&checked, grade) {
             if switch_to(cfg, &mut st, &adapters, &health::prefer_working(&s, &h)) {
-                state::log(&format!("Переключено: «{}» ({reason}), теперь работает «{}».", active.name, s.name));
+                state::log(&format!("Переключено с «{}» на «{}». Причина: «{}» — {reason}.", active.name, s.name, active.name));
+                state::log(&choice_note(&s.name, &h, &checked));
                 *self = Watcher::default();
                 return;
             }
         }
         if grade == Grade::Dead {
-            if let Some((s, h)) = best(&check_all(cfg, &fallback), Grade::Dead) {
+            let checked_fallback = check_all(cfg, &fallback);
+            if let Some((s, h)) = best(&checked_fallback, Grade::Dead) {
                 if switch_to(cfg, &mut st, &adapters, &health::prefer_working(&s, &h)) {
                     state::log(&format!(
-                        "Переключено на обычный DNS «{}»: «{}» и серверы для ИИ не отвечают. \
+                        "Переключено с «{}» на обычный DNS «{}»: серверы для ИИ не подошли. \
                          Интернет работает, ИИ-сервисы могут не открываться.",
-                        s.name, active.name
+                        active.name, s.name
                     ));
+                    state::log(&format!("Серверы для ИИ: {}.", candidates_note(&checked, None)));
                     *self = Watcher::default();
                     return;
                 }
@@ -229,7 +233,11 @@ impl Watcher {
         }
         // Текущий работает хотя бы частично, а лучше нет: оставляем и ищем дальше.
         if !self.stuck_logged {
-            state::log(&format!("«{}»: {reason}. Лучше вариантов сейчас нет, оставляю его.", active.name));
+            state::log(&format!(
+                "«{}» — {reason}. Лучше вариантов сейчас нет, оставляю его. Проверены: {}.",
+                active.name,
+                candidates_note(&checked, None)
+            ));
             self.stuck_logged = true;
         }
     }
@@ -255,10 +263,16 @@ impl Watcher {
         let (same, fallback) = candidates(cfg, &preferred);
         let mut first = vec![preferred.clone()];
         first.extend(same);
-        let found = best(&check_all(cfg, &first), Grade::Dead).or_else(|| best(&check_all(cfg, &fallback), Grade::Dead));
+        let mut checked = check_all(cfg, &first);
+        let mut found = best(&checked, Grade::Dead);
+        if found.is_none() {
+            checked = check_all(cfg, &fallback);
+            found = best(&checked, Grade::Dead);
+        }
         if let Some((s, h)) = found {
             if switch_to(cfg, st, adapters, &health::prefer_working(&s, &h)) {
                 state::log(&format!("«{}» отвечает, переключил на него с DNS от роутера.", s.name));
+                state::log(&choice_note(&s.name, &h, &checked));
             }
         }
     }
@@ -275,6 +289,27 @@ fn candidates(cfg: &Config, current: &DnsServer) -> (Vec<DnsServer>, Vec<DnsServ
         Vec::new()
     };
     (same, fallback)
+}
+
+/// Почему выбран именно этот сервер: его состояние и состояние остальных проверенных.
+fn choice_note(chosen: &str, health: &Health, checked: &[(DnsServer, Health)]) -> String {
+    let others = candidates_note(checked, Some(chosen));
+    let rule = "выбирается лучший по проверке, при равенстве тот, что выше в списке";
+    if others.is_empty() {
+        format!("Выбран «{chosen}» ({rule}): {}.", health.summary())
+    } else {
+        format!("Выбран «{chosen}» ({rule}): {}. Остальные: {others}.", health.summary())
+    }
+}
+
+/// Состояние проверенных серверов через точку с запятой, кроме `skip`.
+fn candidates_note(checked: &[(DnsServer, Health)], skip: Option<&str>) -> String {
+    checked
+        .iter()
+        .filter(|(s, _)| Some(s.name.as_str()) != skip)
+        .map(|(s, h)| format!("«{}» — {}", s.name, h.summary()))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Проверяет серверы параллельно, порядок списка сохраняется.
@@ -420,6 +455,18 @@ mod tests {
             services: vec![ServiceHealth { name: "Gemini", dns_error: None, proxies: vec![(std::net::Ipv4Addr::LOCALHOST, proxy)] }],
         };
         (server, h)
+    }
+
+    #[test]
+    fn choice_note_explains_without_nested_brackets() {
+        let list = vec![fake("GeoHide EU", Some(200), false), fake("dns-ai", Some(30), true)];
+        let note = choice_note("dns-ai", &list[1].1, &list);
+        assert!(note.starts_with("Выбран «dns-ai»"));
+        assert!(note.contains("«GeoHide EU» — Gemini не открывается: прокси не отвечает"));
+        assert!(!note.contains("dns-ai» —"));
+        let reason = fake("MagicDNS", None, true).1.problem().unwrap();
+        assert_eq!(reason, "не отвечает: нет ответа");
+        assert!(!reason.contains('('));
     }
 
     #[test]

@@ -31,6 +31,8 @@ fn safety_servers() -> Vec<DnsServer> {
         ai_bypass: false,
         doh_only: false,
         note: String::new(),
+        builtin: false,
+        edited: false,
     };
     vec![
         make("Cloudflare", "1.1.1.1", "2606:4700:4700::1111", "https://cloudflare-dns.com/dns-query"),

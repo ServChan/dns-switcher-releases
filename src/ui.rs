@@ -1,9 +1,17 @@
+mod diagram;
+mod settings;
+mod simple;
+
 use crate::apply::{self, Action, Outcome};
-use crate::config::{Config, DnsServer, Failover, LastResort, default_servers, parse_ip_list};
-use crate::health::{self, Grade, Health, Method};
+use crate::browsers;
+use crate::config::{Config, DnsServer, Failover, LastResort, ThemeChoice, UiMode, default_servers, parse_ip_list};
+use crate::health::{self, EndToEnd, Grade, Health, Method};
+use crate::install;
 use crate::monitor;
 use crate::net::{self, Adapter};
 use crate::state::{self, RuntimeState};
+use crate::update;
+use std::path::PathBuf;
 use crate::theme::{self, Palette, palette, semibold};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Frame, Id, Key, Layout, Margin, Modal, Rect, Response,
@@ -34,6 +42,33 @@ enum Msg {
     Done { done: Done, outcomes: Vec<Outcome> },
     Health { name: String, health: Health },
     Task(Result<bool, String>),
+    Browsers(Vec<browsers::BrowserDns>),
+    BrowserFixed(String, Result<(), String>),
+    E2e(Option<EndToEnd>),
+    AutoPicked(Vec<(DnsServer, Health)>),
+    UpdateChecked(Result<Option<update::Manifest>, String>),
+    UpdateDownloaded(Result<PathBuf, String>),
+    ListUpdated(Result<(u32, Vec<String>), String>),
+    Ipv6(String, bool, Result<(), String>),
+}
+
+/// Что показано в окне.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Main,
+    Settings(Section),
+    Help,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Section {
+    Appearance,
+    Protection,
+    Checks,
+    Notifications,
+    Browsers,
+    Updates,
+    About,
 }
 
 #[derive(Clone)]
@@ -70,6 +105,8 @@ struct Editor {
     note: String,
     ai_bypass: bool,
     doh_only: bool,
+    /// Редактируется стандартный сервер: после сохранения он помечается изменённым.
+    builtin: bool,
     error: Option<String>,
 }
 
@@ -88,6 +125,7 @@ impl Editor {
             note: s.note.clone(),
             ai_bypass: s.ai_bypass,
             doh_only: s.doh_only,
+            builtin: s.builtin,
             error: None,
         }
     }
@@ -101,6 +139,8 @@ impl Editor {
             ai_bypass: self.ai_bypass,
             doh_only: self.doh_only,
             note: self.note.trim().to_string(),
+            builtin: self.builtin,
+            edited: self.builtin,
         }
     }
 }
@@ -130,8 +170,19 @@ pub struct DnsApp {
     selected: Option<usize>,
     editor: Option<Editor>,
     confirm: Option<Confirm>,
-    failover_editor: Option<Failover>,
     show_log: bool,
+    view: View,
+    browsers: Vec<browsers::BrowserDns>,
+    last_browsers: Instant,
+    e2e: Option<EndToEnd>,
+    updates: update::UpdateState,
+    update_busy: Option<String>,
+    auto_picking: bool,
+    new_probe: (String, String),
+    /// Ход и итог исправления браузеров: показывается прямо в их плашке.
+    browser_note: HashMap<String, (bool, String)>,
+    /// Контекст окна: фоновые действия просят по нему перерисовку.
+    ctx: egui::Context,
     status: Option<Status>,
     busy: Option<String>,
     task_busy: bool,
@@ -168,8 +219,17 @@ impl DnsApp {
             selected: None,
             editor: None,
             confirm: None,
-            failover_editor: None,
             show_log: false,
+            view: View::Main,
+            browsers: Vec::new(),
+            last_browsers: Instant::now(),
+            e2e: None,
+            updates: update::UpdateState::load(),
+            update_busy: None,
+            auto_picking: false,
+            new_probe: Default::default(),
+            browser_note: HashMap::new(),
+            ctx: ctx.clone(),
             status: None,
             busy: None,
             task_busy: false,
@@ -200,7 +260,16 @@ impl DnsApp {
             .iter()
             .filter(|a| app.chosen.contains(&a.guid))
             .find_map(|a| app.server_in_use(a));
+        settings::apply_theme(ctx, app.config.theme);
         app.start_sweep(ctx);
+        app.start_browser_scan(ctx);
+        // Свежая версия проверяется при открытии окна не чаще раза в день.
+        if app.config.updates.app
+            && update::configured()
+            && update::now_secs().saturating_sub(app.updates.last_app_check) >= update::CHECK_EVERY_SECS
+        {
+            app.check_update(ctx);
+        }
         #[cfg(debug_assertions)]
         app.debug_setup(ctx);
         app
@@ -212,11 +281,21 @@ impl DnsApp {
         if std::env::var("DNS_SWITCHER_DEBUG_THEME").as_deref() == Ok("light") {
             ctx.set_theme(egui::Theme::Light);
         }
+        match std::env::var("DNS_SWITCHER_DEBUG_MODE").as_deref() {
+            Ok("simple") => self.config.ui_mode = UiMode::Simple,
+            Ok("advanced") => self.config.ui_mode = UiMode::Advanced,
+            _ => {}
+        }
         if let Ok(name) = std::env::var("DNS_SWITCHER_DEBUG_SELECT") {
             self.selected = self.config.servers.iter().position(|s| s.name == name);
         }
         match std::env::var("DNS_SWITCHER_DEBUG_DIALOG").as_deref() {
-            Ok("failover") => self.failover_editor = Some(self.config.failover.clone()),
+            Ok("failover") => self.view = View::Settings(Section::Protection),
+            Ok("settings") => self.view = View::Settings(Section::Appearance),
+            Ok("browsers") => self.view = View::Settings(Section::Browsers),
+            Ok("updates") => self.view = View::Settings(Section::Updates),
+            Ok("checks") => self.view = View::Settings(Section::Checks),
+            Ok("help") => self.view = View::Help,
             Ok("log") => self.show_log = true,
             Ok("editor") => self.editor = Some(Editor::new_server()),
             Ok("confirm") => self.confirm = Some(Confirm::Reset),
@@ -245,6 +324,10 @@ impl DnsApp {
             }
             self.runtime = RuntimeState::load();
             self.log_tail = state::read_log(200);
+            self.updates = update::UpdateState::load();
+        }
+        if self.last_browsers.elapsed() >= Duration::from_secs(30) {
+            self.start_browser_scan(ctx);
         }
         if self.last_sweep.elapsed() >= SWEEP_EVERY {
             self.start_sweep(ctx);
@@ -339,8 +422,9 @@ impl DnsApp {
             self.health.insert(server.name.clone(), HealthView::Running);
             let tx = self.tx.clone();
             let ctx = ctx.clone();
+            let probes = self.config.probes.clone();
             std::thread::spawn(move || {
-                let health = health::check(&server, use_doh);
+                let health = health::check(&server, use_doh, &probes);
                 let _ = tx.send(Msg::Health { name: server.name, health });
                 ctx.request_repaint();
             });
@@ -362,8 +446,88 @@ impl DnsApp {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Health { name, health } => {
+                    // Для сервера, который сейчас стоит, заодно сквозная проверка через Windows.
+                    if self.active_server().is_some_and(|s| s.name == name) {
+                        let server = self.active_server().unwrap();
+                        let (tx, h) = (self.tx.clone(), health.clone());
+                        std::thread::spawn(move || {
+                            let _ = tx.send(Msg::E2e(health::end_to_end(&server, &h)));
+                        });
+                    }
                     self.health.insert(name, HealthView::Done(health));
                 }
+                Msg::E2e(e) => self.e2e = e,
+                Msg::Browsers(list) => self.browsers = list,
+                Msg::BrowserFixed(name, result) => match result {
+                    Ok(()) => {
+                        state::log(&format!("{name} переключён на DNS Windows."));
+                        self.browser_note.insert(name.clone(), (true, "Исправлено: браузер пользуется DNS Windows.".into()));
+                        self.set_status(StatusKind::Success, format!("{name} теперь пользуется DNS Windows: обход работает и в нём."));
+                    }
+                    Err(e) => {
+                        self.browser_note.insert(name.clone(), (false, e.clone()));
+                        self.set_status(StatusKind::Error, e);
+                    }
+                },
+                Msg::AutoPicked(checked) => self.finish_auto_pick(checked),
+                Msg::UpdateChecked(result) => {
+                    self.update_busy = None;
+                    let mut us = update::UpdateState::load();
+                    us.last_app_check = update::now_secs();
+                    match result {
+                        Ok(found) => {
+                            if found.is_none() {
+                                self.set_status(StatusKind::Success, format!("Установлена последняя версия {}.", install::VERSION));
+                            }
+                            us.available = found;
+                        }
+                        Err(e) => self.set_status(StatusKind::Error, format!("Проверка обновлений не удалась: {e}.")),
+                    }
+                    us.save();
+                    self.updates = us;
+                }
+                Msg::UpdateDownloaded(result) => {
+                    self.update_busy = None;
+                    match result.and_then(|path| update::run_update(&path)) {
+                        // Установщик сам закроет эту копию и откроет новую.
+                        Ok(()) => std::process::exit(0),
+                        Err(e) => self.set_status(StatusKind::Error, format!("Обновление не удалось: {e}.")),
+                    }
+                }
+                Msg::ListUpdated(result) => {
+                    self.update_busy = None;
+                    match result {
+                        Ok((version, changes)) => {
+                            self.config = Config::load();
+                            let text = if changes.is_empty() {
+                                format!("Список серверов актуален (версия {version}).")
+                            } else {
+                                format!("Список серверов обновлён до версии {version}: {}.", changes.join(", "))
+                            };
+                            self.set_status(StatusKind::Success, text);
+                            self.start_sweep_quiet();
+                        }
+                        Err(e) => self.set_status(StatusKind::Error, format!("Список серверов не обновлён: {e}.")),
+                    }
+                }
+                Msg::Ipv6(name, enabled, result) => match result {
+                    Ok(()) => {
+                        if enabled {
+                            self.config.ipv6_disabled.retain(|n| n != &name);
+                            state::log(&format!("IPv6 снова включён на подключении {name}."));
+                        } else if !self.config.ipv6_disabled.contains(&name) {
+                            self.config.ipv6_disabled.push(name.clone());
+                            state::log(&format!("IPv6 выключен на подключении {name}, чтобы сервисы не открывались мимо прокси."));
+                        }
+                        self.save_config();
+                        self.refresh_adapters();
+                        self.set_status(
+                            StatusKind::Success,
+                            if enabled { format!("IPv6 снова включён на {name}.") } else { format!("IPv6 выключен на {name}.") },
+                        );
+                    }
+                    Err(e) => self.set_status(StatusKind::Error, format!("Не удалось изменить IPv6 на {name}: {e}")),
+                },
                 Msg::Done { done, outcomes } => {
                     self.busy = None;
                     self.finish_action(done, outcomes);
@@ -596,7 +760,7 @@ impl DnsApp {
             ui.label(RichText::new(state_text).color(color));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("Настроить").clicked() {
-                    self.failover_editor = Some(self.config.failover.clone());
+                    self.view = View::Settings(Section::Protection);
                 }
                 if ui.button("Журнал").clicked() {
                     self.log_tail = state::read_log(200);
@@ -698,7 +862,7 @@ impl DnsApp {
         // Стрелки вверх и вниз переключают выбранный сервер.
         if self.editor.is_none()
             && self.confirm.is_none()
-            && self.failover_editor.is_none()
+            && self.view == View::Main
             && !self.show_log
             && !ctx.egui_wants_keyboard_input()
         {
@@ -913,8 +1077,9 @@ impl DnsApp {
                             self.health.insert(server.name.clone(), HealthView::Running);
                             let tx = self.tx.clone();
                             let (s, use_doh, ctx) = (server.clone(), self.config.use_doh, ctx.clone());
+                            let probes = self.config.probes.clone();
                             std::thread::spawn(move || {
-                                let health = health::check(&s, use_doh);
+                                let health = health::check(&s, use_doh, &probes);
                                 let _ = tx.send(Msg::Health { name: s.name, health });
                                 ctx.request_repaint();
                             });
@@ -1028,7 +1193,7 @@ impl DnsApp {
                             (format!("работает {} из {total} прокси", s.ok_count()), p.warn_text)
                         };
                         ui.horizontal(|ui| {
-                            ui.label(s.name);
+                            ui.label(&s.name);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.label(RichText::new(text).color(color));
                             });
@@ -1140,8 +1305,9 @@ impl DnsApp {
                         self.health.insert(server.name.clone(), HealthView::Running);
                         let tx = self.tx.clone();
                         let (use_doh, ctx) = (self.config.use_doh, ctx.clone());
+                        let probes = self.config.probes.clone();
                         std::thread::spawn(move || {
-                            let health = health::check(&server, use_doh);
+                            let health = health::check(&server, use_doh, &probes);
                             let _ = tx.send(Msg::Health { name: server.name, health });
                             ctx.request_repaint();
                         });
@@ -1220,7 +1386,11 @@ impl DnsApp {
             DialogResult::Cancel => {}
             DialogResult::Accept => match confirm {
                 Confirm::Delete(i) => {
-                    let name = self.config.servers.remove(i).name;
+                    let removed = self.config.servers.remove(i);
+                    if removed.builtin && !self.config.hidden_builtin.contains(&removed.name) {
+                        self.config.hidden_builtin.push(removed.name.clone());
+                    }
+                    let name = removed.name;
                     self.selected = match self.selected {
                         Some(s) if s == i => None,
                         Some(s) if s > i => Some(s - 1),
@@ -1239,122 +1409,6 @@ impl DnsApp {
                 }
                 Confirm::Reset => self.start_action(ctx, Action::Reset, Done::Reset),
             },
-        }
-    }
-
-    fn failover_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut f) = self.failover_editor.take() else { return };
-        let mut result = DialogResult::Open;
-        modal(ctx, "failover").show(ctx, |ui| {
-            let p = palette(ui);
-            ui.set_width(520.0);
-            ui.heading("Защита от сбоев");
-            ui.add_space(6.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(
-                        "Программа регулярно проверяет текущий DNS-сервер. Если он перестал отвечать, \
-                         а интернет есть, она переключает подключение на следующий рабочий сервер.",
-                    )
-                    .color(p.text_weak),
-                )
-                .wrap(),
-            );
-            ui.add_space(14.0);
-
-            ui.checkbox(&mut f.safety_net, "Страховка: дописывать Cloudflare и Google последними адресами");
-            ui.add(
-                egui::Label::new(
-                    RichText::new(
-                        "Если основной сервер не ответит, Windows сама перейдёт на 1.1.1.1 и 8.8.8.8,                          и интернет не пропадёт, даже когда программа закрыта. В такие минуты                          ИИ-сервисы могут не открываться. Действует со следующего «Применить».",
-                    )
-                    .small()
-                    .color(p.text_weak),
-                )
-                .wrap(),
-            );
-            ui.add_space(12.0);
-            ui.checkbox(&mut f.enabled, "Переключать на резервный сервер, если текущий не отвечает");
-            ui.add_enabled_ui(f.enabled, |ui| {
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label("Проверять каждые");
-                    for (secs, text) in INTERVALS {
-                        if ui.selectable_label(f.interval_secs == secs, text).clicked() {
-                            f.interval_secs = secs;
-                        }
-                    }
-                });
-                ui.add_space(10.0);
-                ui.checkbox(&mut f.return_to_preferred, "Возвращаться к выбранному серверу, когда он снова заработает");
-                ui.add_space(10.0);
-                ui.label("Если не отвечает ни один сервер для ИИ:");
-                ui.radio_value(
-                    &mut f.last_resort,
-                    LastResort::Regular,
-                    "Переключать на обычные DNS (интернет работает, ИИ-сервисы могут не открываться)",
-                );
-                ui.radio_value(&mut f.last_resort, LastResort::Dhcp, "Сразу переключать на DNS от роутера");
-                ui.add(
-                    egui::Label::new(
-                        RichText::new("Если не отвечают и они, всегда включается DNS от роутера, чтобы интернет не пропал.")
-                            .small()
-                            .color(p.text_weak),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(12.0);
-                ui.checkbox(&mut f.background, "Следить и после закрытия окна (запуск при входе в Windows)");
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(
-                            "Создаёт задание «DnsSwitcher Watchdog» в Планировщике заданий. \
-                             Окно для этого держать открытым не нужно.",
-                        )
-                        .small()
-                        .color(p.text_weak),
-                    )
-                    .wrap(),
-                );
-            });
-            ui.add_space(10.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(
-                        "Очередь резервных серверов совпадает с порядком в списке. Менять порядок: \
-                         кнопки «Выше» и «Ниже» у сервера или правый щелчок по нему.",
-                    )
-                    .small()
-                    .color(p.text_weak),
-                )
-                .wrap(),
-            );
-            ui.add_space(18.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if accent_button(ui, p, "Сохранить", false, true, false).clicked() {
-                    result = DialogResult::Accept;
-                }
-                if secondary_button(ui, "Отмена").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                    result = DialogResult::Cancel;
-                }
-            });
-        });
-
-        match result {
-            DialogResult::Open => self.failover_editor = Some(f),
-            DialogResult::Cancel => {}
-            DialogResult::Accept => {
-                let want_background = f.enabled && f.background;
-                let had_background = self.config.failover.background;
-                self.config.failover = f;
-                self.config.failover.background = want_background;
-                self.save_config();
-                if want_background != had_background {
-                    self.set_background(ctx, want_background);
-                } else {
-                    self.set_status(StatusKind::Success, "Настройки защиты от сбоев сохранены.");
-                }
-            }
         }
     }
 
@@ -1398,7 +1452,260 @@ impl DnsApp {
     }
 }
 
+// ---------- Действия окна: подбор, браузеры, обновления, IPv6 ----------
+
 impl DnsApp {
+    /// «Подобрать лучший сервер»: проверить все серверы для ИИ и включить лучший.
+    fn start_auto_pick(&mut self, ctx: &egui::Context) {
+        if self.auto_picking || self.blocker().is_some() {
+            return;
+        }
+        self.auto_picking = true;
+        self.status = None;
+        let cfg = self.config.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        for s in cfg.servers.iter().filter(|s| s.ai_bypass) {
+            self.health.insert(s.name.clone(), HealthView::Running);
+        }
+        std::thread::spawn(move || {
+            let ai: Vec<DnsServer> = cfg.servers.iter().filter(|s| s.ai_bypass).cloned().collect();
+            let checked = monitor::check_all(&cfg, &ai);
+            let _ = tx.send(Msg::AutoPicked(checked));
+            ctx.request_repaint();
+        });
+    }
+
+    fn finish_auto_pick(&mut self, checked: Vec<(DnsServer, Health)>) {
+        self.auto_picking = false;
+        for (s, h) in &checked {
+            self.health.insert(s.name.clone(), HealthView::Done(h.clone()));
+        }
+        let snapshot = state::Snapshot::load();
+        let rank = |name: &str| snapshot.reliability(name).map(|r| 100 - r).unwrap_or(50);
+        match monitor::best(&checked, Grade::Dead, rank) {
+            Some((s, h)) if h.grade() < Grade::ServiceDown => {
+                let Some(index) = self.config.servers.iter().position(|x| x.name == s.name) else { return };
+                self.selected = Some(index);
+                let server = health::prefer_working(&s, &h);
+                let done = Done::Applied(s.name.clone());
+                let action = Action::Apply {
+                    server,
+                    use_doh: self.config.use_doh,
+                    safety_net: self.config.failover.safety_net,
+                };
+                state::log(&monitor::candidates_note(&checked, None));
+                let ctx = self.ctx.clone();
+                self.start_action(&ctx, action, done);
+            }
+            _ => self.set_status(
+                StatusKind::Error,
+                format!(
+                    "Сейчас ни один сервер для ИИ не открывает все сервисы. Проверены: {}.",
+                    monitor::candidates_note(&checked, None)
+                ),
+            ),
+        }
+    }
+
+    /// Перепроверка без смены статуса (после обновления списка).
+    fn start_sweep_quiet(&mut self) {
+        self.last_sweep = Instant::now() - SWEEP_EVERY;
+    }
+
+    fn start_browser_scan(&mut self, ctx: &egui::Context) {
+        self.last_browsers = Instant::now();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Browsers(browsers::detect()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn fix_browser(&mut self, ctx: &egui::Context, b: &browsers::BrowserDns) {
+        let note = if b.running { format!("Закрываю {}, исправляю и открываю снова…", b.name) } else { "Исправляю…".to_string() };
+        self.browser_note.insert(b.name.to_string(), (true, note));
+        let (tx, ctx, b) = (self.tx.clone(), ctx.clone(), b.clone());
+        std::thread::spawn(move || {
+            // Свежие сведения: браузер мог уже закрыться.
+            let fresh = browsers::detect().into_iter().find(|x| x.name == b.name).unwrap_or(b);
+            let result = browsers::close_fix_reopen(&fresh);
+            let _ = tx.send(Msg::BrowserFixed(fresh.name.to_string(), result));
+            let _ = tx.send(Msg::Browsers(browsers::detect()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn check_update(&mut self, ctx: &egui::Context) {
+        if !update::configured() || self.update_busy.is_some() {
+            return;
+        }
+        self.update_busy = Some("Проверяю обновления…".into());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::UpdateChecked(update::check_app()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn download_update(&mut self, ctx: &egui::Context, m: update::Manifest) {
+        self.update_busy = Some(format!("Скачиваю версию {}…", m.version));
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::UpdateDownloaded(update::download_app(&m)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn update_list_now(&mut self, ctx: &egui::Context) {
+        if !update::configured() {
+            return;
+        }
+        self.update_busy = Some("Обновляю список серверов…".into());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        let keep: Vec<String> = [self.runtime.preferred.clone(), self.runtime.active.clone()].into_iter().flatten().collect();
+        std::thread::spawn(move || {
+            let result = update::fetch_server_list().map(|list| {
+                let mut cfg = Config::load();
+                let changes = cfg.apply_server_list(&list, &keep);
+                let _ = cfg.save();
+                (list.version, changes)
+            });
+            let _ = tx.send(Msg::ListUpdated(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn set_ipv6(&mut self, adapter: &str, enabled: bool) {
+        let (tx, name) = (self.tx.clone(), adapter.to_string());
+        std::thread::spawn(move || {
+            let result = net::set_ipv6(&name, enabled);
+            let _ = tx.send(Msg::Ipv6(name, enabled, result));
+        });
+    }
+
+    /// Верхняя строка: режим, справка, настройки, обновление.
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        let ctx = ui.ctx().clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(install::APP_NAME).family(semibold()).size(17.0));
+            ui.add_space(12.0);
+            if self.view == View::Main {
+                let mut mode = self.config.ui_mode;
+                ui.selectable_value(&mut mode, UiMode::Simple, "Простой режим");
+                ui.selectable_value(&mut mode, UiMode::Advanced, "Подробный режим");
+                if mode != self.config.ui_mode {
+                    self.config.ui_mode = mode;
+                    self.save_config();
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Настройки").clicked() {
+                    self.view = View::Settings(Section::Appearance);
+                }
+                if ui.button("Как это работает").clicked() {
+                    self.view = View::Help;
+                }
+                if let Some(m) = self.updates.available.clone() {
+                    let text = match &self.update_busy {
+                        Some(b) => b.clone(),
+                        None => format!("Обновить до {}", m.version),
+                    };
+                    if accent_button(ui, p, &text, self.update_busy.is_some(), self.update_busy.is_none(), false)
+                        .on_hover_text(if m.notes.is_empty() { "Новая версия программы.".to_string() } else { m.notes.clone() })
+                        .clicked()
+                    {
+                        self.download_update(&ctx, m);
+                    }
+                }
+            });
+        });
+    }
+
+    /// Жёлтые плашки: что мешает обходу и что с этим сделать.
+    fn banners(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        let ctx = ui.ctx().clone();
+        let banner = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.add_space(8.0);
+            Frame::new()
+                .fill(p.surface)
+                .stroke(Stroke::new(1.0, p.warn_text))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| add(ui));
+                });
+        };
+
+        if !self.is_admin {
+            banner(ui, &mut |ui: &mut egui::Ui| {
+                ui.label(RichText::new("Нет прав администратора:").family(semibold()).color(p.warn_text));
+                ui.label("без них программа не может менять DNS.");
+                if ui.button("Перезапустить с правами администратора").clicked()
+                    && crate::elevate::relaunch_as_admin(&["--wait-gui".to_string()]).is_ok()
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+        }
+
+        for b in self.bypassing_browsers().into_iter().cloned().collect::<Vec<_>>() {
+            banner(ui, &mut |ui: &mut egui::Ui| {
+                ui.label(RichText::new(format!("{} обходит DNS Windows:", b.name)).family(semibold()).color(p.warn_text));
+                ui.label("у него свой защищённый DNS, поэтому обход в нём не работает.");
+                if b.can_fix() {
+                    let label = if b.running { format!("Закрыть {} и исправить", b.name) } else { "Исправить".to_string() };
+                    let hover = if b.running {
+                        "Браузер закроется как обычно, переключится на DNS Windows и откроется снова. Вкладки сохранятся, \
+                         если в нём включено «Продолжить работу с того же места»."
+                    } else {
+                        "Браузер начнёт пользоваться DNS Windows."
+                    };
+                    if ui.button(label).on_hover_text(hover).clicked() {
+                        self.fix_browser(&ctx, &b);
+                    }
+                    if let Some((ok, note)) = self.browser_note.get(b.name) {
+                        ui.label(RichText::new(note).small().color(if *ok { p.text_weak } else { p.danger_text }));
+                    }
+                } else {
+                    ui.label(
+                        RichText::new(format!("Задано политикой. Вручную: {} → «Безопасный DNS» → выключить.", b.settings_url))
+                            .small()
+                            .color(p.text_weak),
+                    );
+                }
+            });
+        }
+
+        // IPv6: сервер отдаёт настоящий адрес, а у подключения есть IPv6.
+        let leak: Vec<String> = match self.active_server().and_then(|s| match self.health.get(&s.name) {
+            Some(HealthView::Done(h)) => Some(h.clone()),
+            _ => None,
+        }) {
+            Some(h) => h.services.iter().filter(|s| s.ipv6_leak).map(|s| s.name.clone()).collect(),
+            None => Vec::new(),
+        };
+        let v6_adapters: Vec<String> = self.chosen_adapters().into_iter().filter(|a| a.up && a.has_ipv6).map(|a| a.name).collect();
+        if !leak.is_empty() && !v6_adapters.is_empty() {
+            banner(ui, &mut |ui: &mut egui::Ui| {
+                ui.label(RichText::new("Утечка через IPv6:").family(semibold()).color(p.warn_text));
+                ui.label(format!("{} могут открываться напрямую, мимо прокси.", leak.join(", ")));
+                for a in &v6_adapters {
+                    if ui
+                        .button(format!("Выключить IPv6 на {a}"))
+                        .on_hover_text("Вернуть можно в настройках, раздел «Проверка серверов».")
+                        .clicked()
+                    {
+                        self.set_ipv6(a, false);
+                    }
+                }
+            });
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll_messages();
@@ -1406,23 +1713,51 @@ impl DnsApp {
         let bg = palette(ui).bg;
         let page = |m: Margin| Frame::new().fill(bg).inner_margin(m);
 
-        egui::Panel::top("connection")
+        egui::Panel::top("topbar")
             .show_separator_line(false)
-            .frame(page(Margin { left: GUTTER, right: GUTTER, top: GUTTER, bottom: 4 }))
-            .show(ui, |ui| self.connection_card(ui));
-        egui::Panel::right("details")
-            .exact_size(DETAILS_WIDTH)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(page(Margin { left: 0, right: GUTTER, top: 12, bottom: GUTTER }))
-            .show(ui, |ui| self.details_panel(ui));
-        egui::CentralPanel::default_margins()
-            .frame(page(Margin { left: GUTTER, right: GUTTER, top: 12, bottom: GUTTER }))
-            .show(ui, |ui| self.servers_list(ui));
+            .frame(page(Margin { left: GUTTER, right: GUTTER, top: 12, bottom: 4 }))
+            .show(ui, |ui| {
+                self.top_bar(ui);
+                if self.view == View::Main {
+                    self.banners(ui);
+                }
+            });
+
+        match (self.view, self.config.ui_mode) {
+            (View::Settings(section), _) => {
+                egui::CentralPanel::default_margins()
+                    .frame(page(Margin::same(GUTTER)))
+                    .show(ui, |ui| self.settings_view(ui, section));
+            }
+            (View::Help, _) => {
+                egui::CentralPanel::default_margins()
+                    .frame(page(Margin::same(GUTTER)))
+                    .show(ui, |ui| self.help_view(ui));
+            }
+            (View::Main, UiMode::Simple) => {
+                egui::CentralPanel::default_margins()
+                    .frame(page(Margin::same(GUTTER)))
+                    .show(ui, |ui| self.simple_view(ui));
+            }
+            (View::Main, UiMode::Advanced) => {
+                egui::Panel::top("connection")
+                    .show_separator_line(false)
+                    .frame(page(Margin { left: GUTTER, right: GUTTER, top: 8, bottom: 4 }))
+                    .show(ui, |ui| self.connection_card(ui));
+                egui::Panel::right("details")
+                    .exact_size(DETAILS_WIDTH)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .frame(page(Margin { left: 0, right: GUTTER, top: 12, bottom: GUTTER }))
+                    .show(ui, |ui| self.details_panel(ui));
+                egui::CentralPanel::default_margins()
+                    .frame(page(Margin { left: GUTTER, right: GUTTER, top: 12, bottom: GUTTER }))
+                    .show(ui, |ui| self.servers_list(ui));
+            }
+        }
 
         self.editor_dialog(&ctx);
         self.confirm_dialog(&ctx);
-        self.failover_dialog(&ctx);
         self.log_dialog(&ctx);
     }
 }
@@ -1463,7 +1798,7 @@ fn health_summary(p: &Palette, h: &HealthView) -> (String, Color32) {
                 Grade::PartialProxies => (format!("часть прокси не отвечает · {ms}"), p.warn_text),
                 Grade::Slow => (format!("медленно · {ms}"), p.warn_text),
                 Grade::ServiceDown => {
-                    let down: Vec<&str> = h.services.iter().filter(|s| !s.works()).map(|s| s.name).collect();
+                    let down: Vec<&str> = h.services.iter().filter(|s| !s.works()).map(|s| s.name.as_str()).collect();
                     let verb = if down.len() > 1 { "не открываются" } else { "не открывается" };
                     (format!("{} {verb}", down.join(" и ")), p.danger_text)
                 }

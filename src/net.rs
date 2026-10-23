@@ -32,6 +32,8 @@ pub struct Adapter {
     pub static_dns: bool,
     /// Адреса, для которых на этом адаптере включено шифрование DoH.
     pub doh_ips: Vec<IpAddr>,
+    /// У адаптера есть глобальный IPv6-адрес: сайты могут открываться по IPv6.
+    pub has_ipv6: bool,
 }
 
 pub fn list_adapters() -> Result<Vec<Adapter>, String> {
@@ -80,8 +82,22 @@ pub fn list_adapters() -> Result<Vec<Adapter>, String> {
             p = entry.Next;
         }
 
+        let mut has_ipv6 = false;
+        let mut u = a.FirstUnicastAddress;
+        while !u.is_null() {
+            let entry = unsafe { &*u };
+            if let Some(IpAddr::V6(v6)) = unsafe { socket_address_to_ip(&entry.Address) } {
+                // Глобальные адреса начинаются с 2000::/3.
+                if v6.segments()[0] & 0xe000 == 0x2000 {
+                    has_ipv6 = true;
+                }
+            }
+            u = entry.Next;
+        }
+
         adapters.push(Adapter {
             index,
+            has_ipv6,
             ipv6_index: a.Ipv6IfIndex,
             static_dns: has_static_dns(&guid),
             doh_ips: read_doh_ips(&guid),
@@ -105,6 +121,16 @@ fn is_placeholder_dns(ip: &IpAddr) -> bool {
         }
         IpAddr::V4(_) => false,
     }
+}
+
+/// Включает или выключает IPv6 на подключении (привязка ms_tcpip6).
+pub fn set_ipv6(adapter_name: &str, enabled: bool) -> Result<(), String> {
+    let verb = if enabled { "Enable-NetAdapterBinding" } else { "Disable-NetAdapterBinding" };
+    let script = format!(
+        "{verb} -Name '{}' -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop",
+        adapter_name.replace('\'', "''")
+    );
+    crate::apply::run_tool("powershell", &["-NoProfile", "-NonInteractive", "-Command", &script])
 }
 
 fn has_static_dns(guid: &str) -> bool {

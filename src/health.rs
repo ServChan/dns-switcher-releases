@@ -4,12 +4,17 @@
 //! устанавливаем с каждым TLS-соединение с нужным именем (SNI), как браузер.
 //! Ответ DNS ещё не значит, что прокси за ним работает.
 
-use crate::config::DnsServer;
+use crate::config::{DnsServer, Probe};
 use crate::doh;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use windows_sys::Win32::NetworkManagement::Dns::{
+    DNS_QUERY_BYPASS_CACHE, DNS_RECORDW, DNS_TYPE_A, DnsFree, DnsFreeRecordList, DnsQuery_W,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 /// Имя для проверки самого DNS.
@@ -17,8 +22,13 @@ const PROBE_NAME: &str = "chatgpt.com";
 /// Дольше этого Windows ответа не ждёт и переходит к следующему адресу,
 /// а значит, к страховочным Cloudflare и Google без обхода ограничений.
 pub const SLOW_MS: u32 = 1500;
-/// Сервисы, которые проверяются у серверов обхода ограничений ИИ.
-pub const AI_PROBES: [(&str, &str); 2] = [("ChatGPT", "chatgpt.com"), ("Gemini", "gemini.google.com")];
+/// Эталонный DNS: с ним сравниваем ответы, чтобы понять, подменяет ли сервер адрес.
+const REFERENCE: [(&str, &str); 2] = [
+    ("1.1.1.1", "https://cloudflare-dns.com/dns-query"),
+    ("8.8.8.8", "https://dns.google/dns-query"),
+];
+const QTYPE_A: u16 = 1;
+const QTYPE_AAAA: u16 = 28;
 /// Сколько прокси из ответа проверять у одного сервиса.
 const MAX_PROXIES: usize = 8;
 
@@ -37,7 +47,13 @@ pub struct IpHealth {
 /// Проверка одного сервиса (ChatGPT, Gemini) через прокси, которые выдал DNS.
 #[derive(Clone, Debug)]
 pub struct ServiceHealth {
-    pub name: &'static str,
+    pub name: String,
+    pub domain: String,
+    /// Сервер подменяет адрес на свой прокси. false: отдаёт настоящий адрес, обхода нет.
+    /// None: сравнить не удалось (эталонный DNS не ответил).
+    pub proxied: Option<bool>,
+    /// Сервер отдаёт настоящий IPv6-адрес сервиса: при работающем IPv6 браузер пойдёт мимо прокси.
+    pub ipv6_leak: bool,
     /// Ошибка, если DNS не дал адресов для этого сервиса.
     pub dns_error: Option<String>,
     pub proxies: Vec<(Ipv4Addr, Result<u32, String>)>,
@@ -49,7 +65,7 @@ impl ServiceHealth {
     }
 
     pub fn works(&self) -> bool {
-        self.dns_error.is_none() && self.ok_count() > 0
+        self.dns_error.is_none() && self.proxied != Some(false) && self.ok_count() > 0
     }
 
     pub fn fully(&self) -> bool {
@@ -61,6 +77,9 @@ impl ServiceHealth {
     }
 
     pub fn first_error(&self) -> Option<&str> {
+        if self.proxied == Some(false) {
+            return Some("сервер отдаёт настоящий адрес, обхода нет");
+        }
         self.dns_error
             .as_deref()
             .or_else(|| self.proxies.iter().find_map(|(_, r)| r.as_ref().err().map(String::as_str)))
@@ -83,6 +102,10 @@ pub enum Grade {
 }
 
 impl Grade {
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
     /// Годится, чтобы оставаться на сервере: сервисы открываются и DNS быстрый.
     /// Если не отвечает часть прокси, браузер сам пробует другой адрес.
     pub fn acceptable(self) -> bool {
@@ -154,7 +177,7 @@ impl Health {
         if self.services.is_empty() {
             format!("работает, DNS {dns}")
         } else {
-            let names: Vec<&str> = self.services.iter().map(|s| s.name).collect();
+            let names: Vec<&str> = self.services.iter().map(|s| s.name.as_str()).collect();
             format!("работает: {} открываются, DNS {dns}", names.join(" и "))
         }
     }
@@ -189,8 +212,9 @@ fn probe_ips(server: &DnsServer) -> Vec<String> {
     if server.ipv4.is_empty() { server.ipv6.clone() } else { server.ipv4.clone() }
 }
 
-/// Проверяет все адреса сервера параллельно, а для серверов обхода ИИ ещё и прокси.
-pub fn check(server: &DnsServer, use_doh: bool) -> Health {
+/// Проверяет все адреса сервера параллельно, а для серверов обхода ИИ ещё и
+/// включённые сервисы из `probes`.
+pub fn check(server: &DnsServer, use_doh: bool, probes: &[Probe]) -> Health {
     let method = method_for(server, use_doh);
     let template = server.doh.clone();
     let handles: Vec<_> = probe_ips(server)
@@ -216,11 +240,13 @@ pub fn check(server: &DnsServer, use_doh: bool) -> Health {
         .and_then(|(_, ip)| ip.parse::<IpAddr>().ok());
     let services = match (server.ai_bypass, fastest) {
         (true, Some(dns_ip)) => {
-            let handles: Vec<_> = AI_PROBES
+            let handles: Vec<_> = probes
                 .iter()
-                .map(|&(name, domain)| {
+                .filter(|p| p.enabled)
+                .cloned()
+                .map(|p| {
                     let template = template.clone();
-                    std::thread::spawn(move || check_service(name, domain, dns_ip, method, &template))
+                    std::thread::spawn(move || check_service(p.name, p.domain, dns_ip, method, &template))
                 })
                 .collect();
             handles.into_iter().filter_map(|h| h.join().ok()).collect()
@@ -230,15 +256,35 @@ pub fn check(server: &DnsServer, use_doh: bool) -> Health {
     Health { method, ips, services }
 }
 
-fn check_service(name: &'static str, domain: &str, dns_ip: IpAddr, method: Method, template: &str) -> ServiceHealth {
-    let addrs = match resolve(dns_ip, method, template, domain) {
+fn check_service(name: String, domain: String, dns_ip: IpAddr, method: Method, template: &str) -> ServiceHealth {
+    let mut out = ServiceHealth { name, domain: domain.clone(), proxied: None, ipv6_leak: false, dns_error: None, proxies: Vec::new() };
+    let addrs = match resolve(dns_ip, method, template, &domain) {
         Ok((_, addrs)) if addrs.is_empty() => {
-            return ServiceHealth { name, dns_error: Some("DNS не дал адресов".into()), proxies: Vec::new() };
+            out.dns_error = Some("DNS не дал адресов".into());
+            return out;
         }
         Ok((_, addrs)) => addrs,
-        Err(e) => return ServiceHealth { name, dns_error: Some(e), proxies: Vec::new() },
+        Err(e) => {
+            out.dns_error = Some(e);
+            return out;
+        }
     };
-    let domain = domain.to_string();
+    // Подменяет ли сервер адрес: ответ, совпадающий с эталонным, значит обхода нет.
+    if let Some(real) = reference(&domain, QTYPE_A) {
+        let real: Vec<Ipv4Addr> = real.iter().filter_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        }).collect();
+        if !real.is_empty() {
+            out.proxied = Some(!addrs.iter().any(|a| real.contains(a)));
+        }
+    }
+    // IPv6: если сервер отдаёт настоящий AAAA, браузер с IPv6 пойдёт напрямую.
+    if let Ok(v6) = resolve_any(dns_ip, method, template, &domain, QTYPE_AAAA) {
+        if let Some(real6) = reference(&domain, QTYPE_AAAA) {
+            out.ipv6_leak = v6.iter().any(|a| real6.contains(a));
+        }
+    }
     let handles: Vec<_> = addrs
         .into_iter()
         .take(MAX_PROXIES)
@@ -247,8 +293,92 @@ fn check_service(name: &'static str, domain: &str, dns_ip: IpAddr, method: Metho
             std::thread::spawn(move || (addr, retry_once(|| tls_probe(addr, &domain))))
         })
         .collect();
-    let proxies = handles.into_iter().filter_map(|h| h.join().ok()).collect();
-    ServiceHealth { name, dns_error: None, proxies }
+    out.proxies = handles.into_iter().filter_map(|h| h.join().ok()).collect();
+    out
+}
+
+/// Ответ эталонного DNS (Cloudflare, затем Google) по DoH. Кэшируется на 10 минут.
+fn reference(domain: &str, qtype: u16) -> Option<Vec<IpAddr>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, u16), (Instant, Vec<IpAddr>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (domain.to_string(), qtype);
+    if let Some((at, ips)) = cache.lock().ok()?.get(&key) {
+        if at.elapsed() < Duration::from_secs(600) {
+            return Some(ips.clone());
+        }
+    }
+    for (ip, template) in REFERENCE {
+        let Ok(addr) = ip.parse::<IpAddr>() else { continue };
+        if let Ok(ips) = retry_once(|| resolve_any(addr, Method::Doh, template, domain, qtype)) {
+            cache.lock().ok()?.insert(key, (Instant::now(), ips.clone()));
+            return Some(ips);
+        }
+    }
+    None
+}
+
+/// Как отвечает сама Windows: системный резолвер в обход кэша.
+pub fn system_resolve(domain: &str) -> Result<Vec<Ipv4Addr>, String> {
+    let name: Vec<u16> = domain.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut results = std::ptr::null_mut();
+    let status = unsafe {
+        DnsQuery_W(
+            name.as_ptr(),
+            DNS_TYPE_A,
+            DNS_QUERY_BYPASS_CACHE,
+            std::ptr::null_mut(),
+            &mut results,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(format!("Windows не смогла узнать адрес (код {status})"));
+    }
+    let mut out = Vec::new();
+    let mut cur = results as *const DNS_RECORDW;
+    while !cur.is_null() {
+        let rec = unsafe { &*cur };
+        if rec.wType == DNS_TYPE_A {
+            out.push(Ipv4Addr::from(unsafe { rec.Data.A.IpAddress }.to_ne_bytes()));
+        }
+        cur = rec.pNext;
+    }
+    unsafe { DnsFree(results as *const _, DnsFreeRecordList) };
+    Ok(out)
+}
+
+/// Сквозная проверка: получает ли Windows ответы от выбранного сервера.
+#[derive(Clone, Debug)]
+pub struct EndToEnd {
+    pub domain: String,
+    pub system: Result<Vec<Ipv4Addr>, String>,
+    /// Windows отдаёт адреса прокси этого сервера.
+    pub via_server: Option<bool>,
+    /// Windows отдаёт настоящие адреса сервиса: обход не действует.
+    pub real: Option<bool>,
+}
+
+impl EndToEnd {
+    pub fn ok(&self) -> bool {
+        self.via_server != Some(false)
+    }
+}
+
+/// Сверяет ответ Windows для первого проверяемого сервиса с ответом сервера.
+pub fn end_to_end(server: &DnsServer, health: &Health) -> Option<EndToEnd> {
+    let service = health.services.iter().find(|s| s.dns_error.is_none())?;
+    let mut server_ips: Vec<Ipv4Addr> = health.services.iter().flat_map(|s| s.proxies.iter().map(|(a, _)| *a)).collect();
+    server_ips.extend(server.ipv4.iter().filter_map(|s| s.parse::<Ipv4Addr>().ok()));
+    let system = system_resolve(&service.domain);
+    let (via_server, real) = match &system {
+        Ok(ips) if !ips.is_empty() => {
+            let via = ips.iter().any(|a| server_ips.contains(a));
+            let real = reference(&service.domain, QTYPE_A).map(|r| ips.iter().any(|a| r.contains(&IpAddr::V4(*a))));
+            (Some(via), real)
+        }
+        _ => (None, None),
+    };
+    Some(EndToEnd { domain: service.domain.clone(), system, via_server, real })
 }
 
 /// Полное TLS-рукопожатие с прокси под именем сервиса. Сертификат проверяется:
@@ -284,10 +414,23 @@ fn retry_once<T>(mut f: impl FnMut() -> Result<T, String>) -> Result<T, String> 
     })
 }
 
+/// Запрос любого типа: адреса из ответа (A или AAAA).
+fn resolve_any(ip: IpAddr, method: Method, template: &str, name: &str, qtype: u16) -> Result<Vec<IpAddr>, String> {
+    let id = query_id();
+    let message = build_query_type(id, name, qtype);
+    let reply = match method {
+        Method::Udp => udp_exchange(ip, &message)?,
+        Method::Doh => doh::query(ip, template, &message, TIMEOUT)?,
+    };
+    validate_reply(&reply, id)?;
+    let (v4, v6) = parse_answers(&reply);
+    Ok(v4.into_iter().map(IpAddr::V4).chain(v6.into_iter().map(IpAddr::V6)).collect())
+}
+
 /// DNS-запрос типа A к одному адресу сервера: время ответа и адреса из ответа.
 fn resolve(ip: IpAddr, method: Method, template: &str, name: &str) -> Result<(u32, Vec<Ipv4Addr>), String> {
     let id = query_id();
-    let message = build_query(id, name);
+    let message = build_query_type(id, name, QTYPE_A);
     let start = Instant::now();
     let reply = match method {
         Method::Udp => udp_exchange(ip, &message)?,
@@ -295,7 +438,7 @@ fn resolve(ip: IpAddr, method: Method, template: &str, name: &str) -> Result<(u3
     };
     validate_reply(&reply, id)?;
     let ms = start.elapsed().as_millis().min(u32::MAX as u128) as u32;
-    Ok((ms, parse_a_records(&reply)))
+    Ok((ms, parse_answers(&reply).0))
 }
 
 /// Есть ли вообще интернет. Нужно, чтобы не переключать DNS, когда отвалился
@@ -357,11 +500,12 @@ fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-/// Адреса A из раздела ответов (CNAME по дороге пропускаются).
-fn parse_a_records(msg: &[u8]) -> Vec<Ipv4Addr> {
+/// Адреса A и AAAA из раздела ответов (CNAME по дороге пропускаются).
+fn parse_answers(msg: &[u8]) -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
     let mut out = Vec::new();
+    let mut out6 = Vec::new();
     if msg.len() < 12 {
-        return out;
+        return (out, out6);
     }
     let qd = u16::from_be_bytes([msg[4], msg[5]]);
     let an = u16::from_be_bytes([msg[6], msg[7]]);
@@ -369,7 +513,7 @@ fn parse_a_records(msg: &[u8]) -> Vec<Ipv4Addr> {
     for _ in 0..qd {
         match skip_name(msg, pos) {
             Some(p) => pos = p + 4,
-            None => return out,
+            None => return (out, out6),
         }
     }
     for _ in 0..an {
@@ -378,14 +522,19 @@ fn parse_a_records(msg: &[u8]) -> Vec<Ipv4Addr> {
         let kind = u16::from_be_bytes([head[0], head[1]]);
         let len = u16::from_be_bytes([head[8], head[9]]) as usize;
         let data = p + 10;
-        if kind == 1 && len == 4 {
+        if kind == QTYPE_A && len == 4 {
             if let Some(b) = msg.get(data..data + 4) {
                 out.push(Ipv4Addr::new(b[0], b[1], b[2], b[3]));
+            }
+        } else if kind == QTYPE_AAAA && len == 16 {
+            if let Some(b) = msg.get(data..data + 16) {
+                let bytes: [u8; 16] = b.try_into().unwrap_or([0; 16]);
+                out6.push(Ipv6Addr::from(bytes));
             }
         }
         pos = data + len;
     }
-    out
+    (out, out6)
 }
 
 fn query_id() -> u16 {
@@ -398,7 +547,7 @@ fn query_id() -> u16 {
     ((nanos >> 8) as u16) ^ COUNTER.fetch_add(0x9e37, Ordering::Relaxed)
 }
 
-fn build_query(id: u16, name: &str) -> Vec<u8> {
+fn build_query_type(id: u16, name: &str, qtype: u16) -> Vec<u8> {
     let mut q = Vec::with_capacity(32);
     q.extend_from_slice(&id.to_be_bytes());
     q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]); // RD, один вопрос
@@ -406,7 +555,9 @@ fn build_query(id: u16, name: &str) -> Vec<u8> {
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
     }
-    q.extend_from_slice(&[0, 0, 1, 0, 1]); // конец имени, тип A, класс IN
+    q.push(0); // конец имени
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&[0, 1]); // класс IN
     q
 }
 
@@ -423,12 +574,15 @@ mod tests {
         m.extend_from_slice(&[0xC0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 6]);
         m.extend_from_slice(b"\x03www\xC0\x13");
         m.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
-        assert_eq!(parse_a_records(&m), vec![Ipv4Addr::new(1, 2, 3, 4)]);
+        assert_eq!(parse_answers(&m).0, vec![Ipv4Addr::new(1, 2, 3, 4)]);
     }
 
     fn svc(results: &[Result<u32, String>]) -> ServiceHealth {
         ServiceHealth {
-            name: "ChatGPT",
+            name: "ChatGPT".into(),
+            domain: "chatgpt.com".into(),
+            proxied: Some(true),
+            ipv6_leak: false,
             dns_error: None,
             proxies: results.iter().map(|r| (Ipv4Addr::LOCALHOST, r.clone())).collect(),
         }
@@ -447,6 +601,9 @@ mod tests {
         assert_eq!(health(Some(50), vec![svc(&[Err("x".into())])]).grade(), Grade::ServiceDown);
         assert_eq!(health(None, vec![]).grade(), Grade::Dead);
         assert!(Grade::Good < Grade::PartialProxies && Grade::Slow < Grade::ServiceDown);
+        let mut not_proxied = svc(&[Ok(80)]);
+        not_proxied.proxied = Some(false);
+        assert_eq!(health(Some(50), vec![not_proxied]).grade(), Grade::ServiceDown);
     }
 
     /// Обращается к настоящим серверам: `cargo test -- --ignored --nocapture`.
@@ -454,8 +611,9 @@ mod tests {
     #[ignore]
     fn live_check_default_servers() {
         println!("internet_ok = {}", internet_ok());
+        let probes = crate::config::default_probes();
         for server in default_servers() {
-            let h = check(&server, true);
+            let h = check(&server, true, &probes);
             let ips: Vec<String> = h
                 .ips
                 .iter()
@@ -465,6 +623,9 @@ mod tests {
                 })
                 .collect();
             println!("{:<18} {:?} {:?}: {}", server.name, h.method, h.grade(), ips.join(" | "));
+            if server.name == "MagicDNS" {
+                println!("    сквозная проверка: {:?}", end_to_end(&server, &h));
+            }
             for s in &h.services {
                 let px: Vec<String> = s
                     .proxies
@@ -474,7 +635,10 @@ mod tests {
                         Err(e) => format!("{a} {e}"),
                     })
                     .collect();
-                println!("    {:<8} {}/{} {:?} {}", s.name, s.ok_count(), s.proxies.len(), s.dns_error, px.join(", "));
+                println!(
+                    "    {:<10} {}/{} proxied={:?} v6leak={} {:?} {}",
+                    s.name, s.ok_count(), s.proxies.len(), s.proxied, s.ipv6_leak, s.dns_error, px.join(", ")
+                );
             }
         }
     }

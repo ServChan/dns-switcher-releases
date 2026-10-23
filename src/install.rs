@@ -341,6 +341,26 @@ fn create_shortcut(link: &Path, target: &Path) -> Result<(), String> {
         .map_err(|e| format!("Не удалось создать ярлык {}: {e}", link.display()))
 }
 
+/// Параметры уже установленной копии: обновление сохраняет их как есть.
+pub fn current_options() -> InstallOptions {
+    InstallOptions {
+        dir: installed_dir().unwrap_or_else(default_dir),
+        start_menu: start_menu_link().exists(),
+        desktop: desktop_link().exists(),
+        no_uac: tasks::exists(tasks::LAUNCHER),
+        background: tasks::exists(tasks::WATCHDOG),
+    }
+}
+
+/// `--update`: тихое обновление без окна мастера, затем запуск программы.
+pub fn silent_update() -> Result<(), String> {
+    let opts = current_options();
+    for step in install_plan() {
+        run_install_step(step, &opts).map_err(|e| format!("{}: {e}", step.title()))?;
+    }
+    launch(&opts.dir)
+}
+
 /// Запускает установленную программу отдельно от установщика.
 pub fn launch(dir: &Path) -> Result<(), String> {
     Command::new(dir.join(EXE_NAME))

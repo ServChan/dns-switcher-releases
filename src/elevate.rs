@@ -9,7 +9,8 @@ use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastE
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, IsIconic, SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow, ShowWindow,
+    FindWindowW, IsIconic, MB_ICONWARNING, MB_OK, MessageBoxW, SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow,
+    ShowWindow,
 };
 
 pub const WINDOW_TITLE: &str = "Переключатель DNS";
@@ -17,6 +18,12 @@ const GUI_LOCK: &str = "Local\\DnsSwitcherGui";
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Простое окно сообщения, когда своего окна у процесса нет.
+pub fn message_box(text: &str) {
+    let (text, title) = (wide(text), wide(WINDOW_TITLE));
+    unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING) };
 }
 
 pub fn is_admin() -> bool {

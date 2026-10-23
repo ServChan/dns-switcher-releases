@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod apply;
+mod browsers;
 mod config;
 mod doh;
 mod elevate;
@@ -12,7 +13,9 @@ mod net;
 mod state;
 mod tasks;
 mod theme;
+mod tray;
 mod ui;
+mod update;
 
 use eframe::egui;
 use std::sync::Arc;
@@ -29,6 +32,14 @@ fn main() -> eframe::Result {
     if !elevate::ensure_admin(&args) {
         return Ok(()); // работу продолжает копия с правами администратора
     }
+    // Тихое обновление из скачанного установщика: без окна мастера.
+    if has("--update") {
+        if let Err(e) = install::silent_update() {
+            state::log(&format!("Обновление не удалось: {e}"));
+            elevate::message_box(&format!("Обновление не удалось.\n\n{e}"));
+        }
+        return Ok(());
+    }
 
     // Запуск не из папки установки открывает мастер (в отладочной сборке не мешает).
     let wizard = if has("--uninstall") {
@@ -41,8 +52,10 @@ fn main() -> eframe::Result {
         None
     };
     // Второе окно программы не открываем, а выводим вперёд первое.
+    // Отладочной сборке правило не мешает: её окно открывается рядом с установленным.
     let gui_lock = match wizard {
         Some(_) => None,
+        None if cfg!(debug_assertions) => None,
         None => match elevate::single_instance(has("--wait-gui")) {
             Some(lock) => Some(lock),
             None => return Ok(()),

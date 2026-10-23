@@ -21,6 +21,12 @@ pub struct DnsServer {
     pub doh_only: bool,
     #[serde(default)]
     pub note: String,
+    /// Сервер из стартового списка: его адреса может обновлять подписанный список с сервера.
+    #[serde(default)]
+    pub builtin: bool,
+    /// Пользователь менял этот сервер вручную: обновления списка его не трогают.
+    #[serde(default)]
+    pub edited: bool,
 }
 
 impl DnsServer {
@@ -78,6 +84,91 @@ pub struct Config {
     /// Версия стартового списка, с которой сохранён этот список.
     #[serde(default)]
     pub defaults_version: u32,
+    /// Простой режим с крупными подсказками или подробный со всем списком.
+    #[serde(default)]
+    pub ui_mode: UiMode,
+    /// Сервисы, которые проверяются через серверы обхода ограничений.
+    #[serde(default = "default_probes")]
+    pub probes: Vec<Probe>,
+    #[serde(default)]
+    pub notify: Notify,
+    #[serde(default)]
+    pub updates: Updates,
+    /// Стандартные серверы, которые пользователь удалил: обновление списка их не вернёт.
+    #[serde(default)]
+    pub hidden_builtin: Vec<String>,
+    /// Версия подписанного списка серверов, уже применённая к этому списку.
+    #[serde(default)]
+    pub remote_list_version: u32,
+    #[serde(default)]
+    pub theme: ThemeChoice,
+    /// Подключения, на которых программа выключила IPv6 (чтобы можно было вернуть).
+    #[serde(default)]
+    pub ipv6_disabled: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub enum ThemeChoice {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub enum UiMode {
+    #[default]
+    Simple,
+    Advanced,
+}
+
+/// Сервис, доступность которого проверяется через прокси серверов для ИИ.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Probe {
+    pub name: String,
+    pub domain: String,
+    pub enabled: bool,
+}
+
+pub fn default_probes() -> Vec<Probe> {
+    let p = |name: &str, domain: &str, enabled: bool| Probe { name: name.into(), domain: domain.into(), enabled };
+    vec![
+        p("ChatGPT", "chatgpt.com", true),
+        p("Gemini", "gemini.google.com", true),
+        p("Claude", "claude.ai", true),
+        p("AI Studio", "aistudio.google.com", false),
+        p("NotebookLM", "notebooklm.google.com", false),
+        p("Copilot", "copilot.microsoft.com", false),
+        p("Perplexity", "www.perplexity.ai", false),
+    ]
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Notify {
+    /// Уведомлять о переключении на резервный сервер и о возврате.
+    pub switches: bool,
+    /// Уведомлять о проблемах, которые программа сама не исправит (браузер, IPv6).
+    pub problems: bool,
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self { switches: true, problems: true }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Updates {
+    /// Раз в день проверять, нет ли новой версии программы.
+    pub app: bool,
+    /// Раз в день подтягивать подписанный список серверов с актуальными адресами.
+    pub server_list: bool,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Self { app: true, server_list: true }
+    }
 }
 
 /// Куда переключаться, когда не отвечает ни один сервер нужной группы.
@@ -128,10 +219,19 @@ impl Default for Config {
             use_doh: true,
             failover: Failover::default(),
             defaults_version: DEFAULTS_VERSION,
+            ui_mode: UiMode::Simple,
+            probes: default_probes(),
+            notify: Notify::default(),
+            updates: Updates::default(),
+            hidden_builtin: Vec::new(),
+            remote_list_version: embedded_list().version,
+            theme: ThemeChoice::System,
+            ipv6_disabled: Vec::new(),
         }
     }
 }
 
+#[cfg(test)]
 fn server(
     name: &str,
     ipv4: &[&str],
@@ -148,94 +248,38 @@ fn server(
         ai_bypass,
         doh_only: false,
         note: note.into(),
+        builtin: true,
+        edited: false,
     }
 }
 
-/// Начальный список. Адреса и порядок по замерам в октябре 2026: в группе ИИ
-/// выше стоят серверы, у которых прокси для ChatGPT и Gemini реально открываются.
+/// Список серверов в виде, в котором он публикуется: release/servers.json.
+/// Тот же файл встроен в программу как стартовый список.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServerList {
+    pub version: u32,
+    pub servers: Vec<DnsServer>,
+}
+
+const EMBEDDED_LIST: &str = include_str!("../release/servers.json");
+
+pub fn embedded_list() -> ServerList {
+    let mut list: ServerList = serde_json::from_str(EMBEDDED_LIST).expect("release/servers.json разбирается");
+    for s in &mut list.servers {
+        s.builtin = true;
+    }
+    list
+}
+
+/// Начальный список: release/servers.json. Адреса и порядок по замерам в октябре 2026;
+/// в группе ИИ выше стоят серверы, у которых прокси для ChatGPT и Gemini открываются.
 /// Порядок задаёт очередь резервных серверов.
 pub fn default_servers() -> Vec<DnsServer> {
-    let mut dns_ai = server(
-        "dns-ai",
-        &["194.87.196.13", "45.151.102.219"],
-        &["2a00:b700:5::3:62", "2a12:5940:d4ef::219"],
-        "https://dns.dns-ai.ru/dns-query",
-        true,
-        "dns-ai.ru. Только зашифрованный DNS: обычный порт 53 не отвечает.",
-    );
-    dns_ai.doh_only = true;
-
-    vec![
-        server(
-            "GeoHide EU",
-            &["143.20.64.192", "45.13.237.213", "37.221.93.128"],
-            &[],
-            "https://eu.geohide.ru/dns-query",
-            true,
-            "eu.geohide.ru. DNS и прокси в Европе: Gemini, AI Studio, NotebookLM, ChatGPT.",
-        ),
-        server(
-            "MagicDNS",
-            &["109.120.132.43", "94.249.177.102"],
-            &[],
-            "https://dns.magicdns.ru/dns-query",
-            true,
-            "magicdns.ru. Claude, Gemini, ChatGPT, Perplexity, Cursor и ещё 30+ сервисов.",
-        ),
-        dns_ai,
-        server(
-            "GeoHide US",
-            &["192.255.159.240", "192.255.159.241"],
-            &[],
-            "https://us.geohide.ru/dns-query",
-            true,
-            "us.geohide.ru. DNS и прокси в США. Часть прокси бывает недоступна.",
-        ),
-        server(
-            "Comss DNS",
-            &["83.220.169.155", "212.109.195.93"],
-            &[],
-            "https://dns.comss.one/dns-query",
-            true,
-            "comss.one. ChatGPT и другие ИИ-сервисы, блокировка рекламы и трекеров.",
-        ),
-        server(
-            "Xbox-DNS",
-            &["111.88.96.54", "111.88.96.55"],
-            &["2a00:ab00:1233:26::50", "2a00:ab00:1233:26::51"],
-            "https://xbox-dns.ru/dns-query",
-            true,
-            "xbox-dns.ru. Xbox Live, игры, ChatGPT, Claude, Gemini, Copilot.",
-        ),
-        server(
-            "AdGuard DNS",
-            &["94.140.14.14", "94.140.15.15"],
-            &["2a10:50c0::ad1:ff", "2a10:50c0::ad2:ff"],
-            "https://dns.adguard-dns.com/dns-query",
-            false,
-            "Блокирует рекламу и трекеры.",
-        ),
-        server(
-            "Google Public DNS",
-            &["8.8.8.8", "8.8.4.4"],
-            &["2001:4860:4860::8888", "2001:4860:4860::8844"],
-            "https://dns.google/dns-query",
-            false,
-            "",
-        ),
-        server(
-            "Cloudflare",
-            &["1.1.1.1", "1.0.0.1"],
-            &["2606:4700:4700::1111", "2606:4700:4700::1001"],
-            "https://cloudflare-dns.com/dns-query",
-            false,
-            "",
-        ),
-    ]
+    embedded_list().servers
 }
 
 /// Версия стартового списка. Когда она растёт, сохранённые списки обновляются в `migrate`.
-pub const DEFAULTS_VERSION: u32 = 3;
+pub const DEFAULTS_VERSION: u32 = 4;
 
 /// Стартовый список версии 2 (с пулом GeoHide RU, у которого не работают прокси).
 const DEFAULTS_V2: [(&str, &[&str]); 10] = [
@@ -321,6 +365,7 @@ impl Config {
             self.servers.len() == list.len()
                 && self.servers.iter().zip(list).all(|(s, (name, ips))| s.name == *name && s.ipv4 == *ips)
         };
+        let was = self.defaults_version;
         if same_as(&DEFAULTS_V1) || same_as(&DEFAULTS_V2) {
             self.servers = default_servers();
         } else if self.defaults_version < 2 {
@@ -340,6 +385,19 @@ impl Config {
                 }
             }
         }
+        if was < 4 {
+            // Серверы, совпадающие со стартовыми, отмечаются как стандартные:
+            // их адреса сможет обновлять подписанный список.
+            let fresh = default_servers();
+            for s in &mut self.servers {
+                if let Some(f) = fresh.iter().find(|f| f.name == s.name) {
+                    s.builtin = true;
+                    s.edited = s.ipv4 != f.ipv4 || s.doh != f.doh;
+                }
+            }
+            // Список уже был: человек пользовался программой и знает её подробный вид.
+            self.ui_mode = UiMode::Advanced;
+        }
         self.defaults_version = DEFAULTS_VERSION;
         true
     }
@@ -351,6 +409,53 @@ impl Config {
 
     pub fn find(&self, name: &str) -> Option<&DnsServer> {
         self.servers.iter().find(|s| s.name == name)
+    }
+
+    /// Применяет подписанный список с сервера. Трогает только стандартные серверы,
+    /// которые пользователь не менял; удалённые им не возвращает; `keep` (выбранный
+    /// и активный сервер) не удаляет. Возвращает, что поменялось, для журнала.
+    pub fn apply_server_list(&mut self, list: &ServerList, keep: &[String]) -> Vec<String> {
+        if list.version <= self.remote_list_version {
+            return Vec::new();
+        }
+        let mut changes = Vec::new();
+        for r in &list.servers {
+            match self.servers.iter_mut().find(|s| s.name == r.name) {
+                Some(s) if s.builtin && !s.edited => {
+                    let same = s.ipv4 == r.ipv4 && s.ipv6 == r.ipv6 && s.doh == r.doh && s.doh_only == r.doh_only;
+                    if !same {
+                        changes.push(format!("«{}»: новые адреса", r.name));
+                    }
+                    s.ipv4 = r.ipv4.clone();
+                    s.ipv6 = r.ipv6.clone();
+                    s.doh = r.doh.clone();
+                    s.doh_only = r.doh_only;
+                    s.note = r.note.clone();
+                    s.ai_bypass = r.ai_bypass;
+                }
+                Some(_) => {}
+                None if self.hidden_builtin.contains(&r.name) => {}
+                None => {
+                    let mut new = r.clone();
+                    new.builtin = true;
+                    new.edited = false;
+                    // В конец своей группы: порядок задаёт очередь резерва.
+                    let at = self.servers.iter().rposition(|s| s.ai_bypass == r.ai_bypass).map(|i| i + 1).unwrap_or(self.servers.len());
+                    self.servers.insert(at, new);
+                    changes.push(format!("добавлен «{}»", r.name));
+                }
+            }
+        }
+        let names: Vec<&str> = list.servers.iter().map(|s| s.name.as_str()).collect();
+        self.servers.retain(|s| {
+            let keep_it = !s.builtin || s.edited || names.contains(&s.name.as_str()) || keep.contains(&s.name);
+            if !keep_it {
+                changes.push(format!("убран «{}»", s.name));
+            }
+            keep_it
+        });
+        self.remote_list_version = list.version;
+        changes
     }
 }
 
@@ -391,6 +496,45 @@ mod tests {
         assert!(cfg.migrate());
         assert!(cfg.find("GeoHide RU").is_none());
         assert_eq!(cfg.servers.len(), default_servers().len());
+    }
+
+    #[test]
+    fn embedded_list_is_valid() {
+        let list = embedded_list();
+        assert!(list.servers.iter().all(|s| s.builtin && s.validate().is_ok()));
+        assert!(list.servers.iter().any(|s| s.ai_bypass) && list.servers.iter().any(|s| !s.ai_bypass));
+    }
+
+    #[test]
+    fn server_list_update_respects_user_changes() {
+        let mut cfg = Config::default();
+        cfg.servers.iter_mut().find(|s| s.name == "Comss DNS").unwrap().edited = true;
+        cfg.hidden_builtin.push("Новый".into());
+        cfg.servers.push(server("Мой DNS", &["10.0.0.1"], &[], "", false, ""));
+        cfg.servers.last_mut().unwrap().builtin = false;
+
+        let mut list = embedded_list();
+        list.version += 1;
+        list.servers.retain(|s| s.name != "Xbox-DNS" && s.name != "GeoHide US");
+        let eu = list.servers.iter_mut().find(|s| s.name == "GeoHide EU").unwrap();
+        eu.ipv4 = vec!["5.175.161.3".into()];
+        let comss = list.servers.iter_mut().find(|s| s.name == "Comss DNS").unwrap();
+        comss.ipv4 = vec!["9.9.9.9".into()];
+        list.servers.push(server("Свежий", &["10.1.1.1"], &[], "", true, ""));
+        list.servers.push(server("Новый", &["10.2.2.2"], &[], "", true, ""));
+
+        let changes = cfg.apply_server_list(&list, &["GeoHide US".to_string()]);
+        assert_eq!(cfg.find("GeoHide EU").unwrap().ipv4, ["5.175.161.3"]);
+        assert_ne!(cfg.find("Comss DNS").unwrap().ipv4, ["9.9.9.9"], "изменённый вручную не трогаем");
+        assert!(cfg.find("Xbox-DNS").is_none(), "убранный из списка удаляется");
+        assert!(cfg.find("GeoHide US").is_some(), "выбранный сервер не удаляем");
+        assert!(cfg.find("Новый").is_none(), "удалённый пользователем не возвращаем");
+        assert!(cfg.find("Мой DNS").is_some());
+        let fresh = cfg.servers.iter().position(|s| s.name == "Свежий").unwrap();
+        let first_regular = cfg.servers.iter().position(|s| !s.ai_bypass).unwrap();
+        assert!(fresh < first_regular, "новый сервер для ИИ встаёт в свою группу");
+        assert!(!changes.is_empty());
+        assert!(cfg.apply_server_list(&list, &[]).is_empty(), "та же версия второй раз не применяется");
     }
 
     #[test]

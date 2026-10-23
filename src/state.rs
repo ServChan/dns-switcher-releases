@@ -39,6 +39,47 @@ impl RuntimeState {
     }
 }
 
+// ---------- Снимок защиты для окна ----------
+
+/// Что знает защита: история проверок серверов и сквозная проверка через Windows.
+/// Пишет процесс защиты, читает окно (надёжность серверов, состояние цепочки).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub updated: String,
+    /// Последние оценки по серверам, от старых к новым: 0 — работает … 4 — не отвечает.
+    pub history: std::collections::HashMap<String, Vec<u8>>,
+    /// Последняя сквозная проверка: получает ли Windows ответы от выбранного сервера.
+    pub e2e_ok: Option<bool>,
+    pub e2e_detail: String,
+}
+
+fn snapshot_path() -> PathBuf {
+    data_dir().join("health.json")
+}
+
+impl Snapshot {
+    pub fn load() -> Self {
+        std::fs::read_to_string(snapshot_path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&mut self) {
+        self.updated = now_text();
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = write_atomic(&snapshot_path(), &text);
+        }
+    }
+
+    /// Доля «годных» проверок сервера в процентах, если история есть.
+    pub fn reliability(&self, name: &str) -> Option<u32> {
+        let h = self.history.get(name).filter(|h| !h.is_empty())?;
+        let good = h.iter().filter(|g| **g <= 1).count();
+        Some((good * 100 / h.len()) as u32)
+    }
+}
+
 // ---------- Журнал ----------
 
 const LOG_KEEP_LINES: usize = 400;

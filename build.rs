@@ -19,6 +19,12 @@ fn main() {
             .compile()
             .expect("не удалось встроить значок");
     }
+    // Открытый ключ проверки обновлений (scripts/release/new-updater-key.ps1).
+    // Без него программа собирается, но обновления выключены.
+    println!("cargo:rerun-if-changed=assets/updater.pub");
+    if let Ok(key) = std::fs::read_to_string("assets/updater.pub") {
+        println!("cargo:rustc-env=DNS_SWITCHER_UPDATER_PUBKEY={}", key.trim());
+    }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icon.ico");
 }

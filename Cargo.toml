@@ -1,17 +1,21 @@
 [package]
 name = "dns-switcher"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2024"
 description = "Переключатель DNS для Windows"
 
 [dependencies]
+base64 = "0.23.1"
+ed25519-dalek = "3.0.0"
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+getrandom = "0.4.3"
 rfd = { version = "0.17.2", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 webpki-roots = "1.0.10"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Globalization", "Win32_UI_Shell", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Globalization", "Win32_UI_Shell", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_Dns", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_System_Diagnostics_ToolHelp"] }
 winreg = "0.56.0"
 
 [build-dependencies]

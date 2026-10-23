@@ -27,6 +27,18 @@ pub fn tls_config() -> Arc<ClientConfig> {
         .clone()
 }
 
+/// Настройки TLS только для HTTP/1.1: так скачиваются обновления.
+pub fn tls_config_http1() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut config = (*tls_config()).clone();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Arc::new(config)
+        })
+        .clone()
+}
+
 /// Разбирает шаблон вида https://host[:port]/path на части.
 fn split_template(template: &str) -> Result<(String, u16, String), String> {
     let rest = template
@@ -222,7 +234,7 @@ fn parse_http(raw: &[u8]) -> Result<Vec<u8>, String> {
     Ok(if chunked { dechunk(body) } else { body.to_vec() })
 }
 
-fn dechunk(mut body: &[u8]) -> Vec<u8> {
+pub fn dechunk(mut body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some(eol) = body.windows(2).position(|w| w == b"\r\n") {
         let size_text = String::from_utf8_lossy(&body[..eol]);

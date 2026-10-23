@@ -1,16 +1,15 @@
 //! Установка и удаление. Программа устанавливает сама себя: копирует свой exe
-//! в Program Files, создаёт ярлыки и запись в «Приложениях» Windows.
+//! в выбранную папку, создаёт ярлыки, задания Планировщика и запись в «Приложениях».
+//! Работа разбита на шаги, чтобы мастер показывал прогресс.
 
 use crate::apply::{self, Action};
-use crate::monitor;
+use crate::config::{Config, data_dir};
 use crate::net;
 use crate::state::{self, RuntimeState};
+use crate::{monitor, tasks};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MessageBoxW,
-};
 use winreg::RegKey;
 use winreg::enums::HKEY_LOCAL_MACHINE;
 
@@ -21,13 +20,96 @@ const UNINSTALL_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstal
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-pub fn install_dir() -> PathBuf {
+#[derive(Clone)]
+pub struct InstallOptions {
+    pub dir: PathBuf,
+    pub start_menu: bool,
+    pub desktop: bool,
+    pub no_uac: bool,
+    pub background: bool,
+}
+
+#[derive(Clone)]
+pub struct UninstallOptions {
+    pub reset_dns: bool,
+    pub remove_settings: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Step {
+    StopRunning,
+    CopyFiles,
+    Shortcuts,
+    Register,
+    Launcher,
+    Background,
+    RemoveTasks,
+    ResetDns,
+    RemoveShortcuts,
+    Unregister,
+    RemoveSettings,
+    RemoveFiles,
+}
+
+impl Step {
+    pub fn title(self) -> &'static str {
+        match self {
+            Step::StopRunning => "Закрываю запущенную программу",
+            Step::CopyFiles => "Копирую файлы",
+            Step::Shortcuts => "Создаю ярлыки",
+            Step::Register => "Добавляю в «Приложения» Windows",
+            Step::Launcher => "Настраиваю запуск без запроса UAC",
+            Step::Background => "Настраиваю фоновую защиту от сбоев",
+            Step::RemoveTasks => "Убираю задания из Планировщика",
+            Step::ResetDns => "Возвращаю автоматический DNS",
+            Step::RemoveShortcuts => "Удаляю ярлыки",
+            Step::Unregister => "Убираю из «Приложений» Windows",
+            Step::RemoveSettings => "Удаляю список серверов и настройки",
+            Step::RemoveFiles => "Удаляю файлы программы",
+        }
+    }
+}
+
+pub fn install_plan() -> Vec<Step> {
+    vec![Step::StopRunning, Step::CopyFiles, Step::Shortcuts, Step::Register, Step::Launcher, Step::Background]
+}
+
+pub fn uninstall_plan(opts: &UninstallOptions) -> Vec<Step> {
+    let mut plan = vec![Step::StopRunning, Step::RemoveTasks];
+    if opts.reset_dns {
+        plan.push(Step::ResetDns);
+    }
+    plan.extend([Step::RemoveShortcuts, Step::Unregister]);
+    if opts.remove_settings {
+        plan.push(Step::RemoveSettings);
+    }
+    plan.push(Step::RemoveFiles);
+    plan
+}
+
+// ---------- Где что лежит ----------
+
+pub fn default_dir() -> PathBuf {
     let base = std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| r"C:\Program Files".into());
     base.join("DnsSwitcher")
 }
 
-pub fn installed_exe() -> PathBuf {
-    install_dir().join(EXE_NAME)
+/// Папка, куда программа уже установлена.
+pub fn installed_dir() -> Option<PathBuf> {
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(UNINSTALL_KEY)
+        .and_then(|k| k.get_value::<String, _>("InstallLocation"))
+        .ok()
+        .map(PathBuf::from)
+        .filter(|d| d.join(EXE_NAME).exists())
+}
+
+pub fn installed_version() -> Option<String> {
+    installed_dir()?;
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(UNINSTALL_KEY)
+        .and_then(|k| k.get_value::<String, _>("DisplayVersion"))
+        .ok()
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -39,16 +121,24 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 /// Программа запущена из папки установки.
 pub fn running_installed() -> bool {
-    std::env::current_exe().map(|exe| same_path(&exe, &installed_exe())).unwrap_or(false)
+    let Some(dir) = installed_dir() else { return false };
+    std::env::current_exe().map(|exe| same_path(&exe, &dir.join(EXE_NAME))).unwrap_or(false)
 }
 
-/// Версия, записанная в «Приложениях», если программа уже установлена.
-pub fn installed_version() -> Option<String> {
-    RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey(UNINSTALL_KEY)
-        .and_then(|k| k.get_value::<String, _>("DisplayVersion"))
-        .ok()
-        .filter(|_| installed_exe().exists())
+/// Папка внутри Program Files: менять там файлы может только администратор.
+/// Это важно, потому что задания запускают программу с наивысшими правами.
+pub fn is_protected_dir(dir: &Path) -> bool {
+    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"].iter().any(|var| {
+        std::env::var_os(var).is_some_and(|base| {
+            dir.to_string_lossy().to_lowercase().starts_with(&base.to_string_lossy().to_lowercase())
+        })
+    })
+}
+
+/// Программа сейчас управляет DNS подключений (было «Применить»).
+pub fn manages_dns() -> bool {
+    let st = RuntimeState::load();
+    st.active.is_some() || st.on_dhcp_fallback
 }
 
 fn start_menu_link() -> PathBuf {
@@ -61,55 +151,163 @@ fn desktop_link() -> PathBuf {
     base.join("Desktop").join(format!("{APP_NAME}.lnk"))
 }
 
+// ---------- Выполнение шагов ----------
+
+pub fn run_install_step(step: Step, opts: &InstallOptions) -> Result<(), String> {
+    let exe = opts.dir.join(EXE_NAME);
+    match step {
+        Step::StopRunning => {
+            stop_other_instances();
+            Ok(())
+        }
+        Step::CopyFiles => copy_self(&opts.dir, &exe),
+        Step::Shortcuts => {
+            for (want, link) in [(opts.start_menu, start_menu_link()), (opts.desktop, desktop_link())] {
+                if want {
+                    create_shortcut(&link, &exe)?;
+                } else {
+                    let _ = std::fs::remove_file(link);
+                }
+            }
+            Ok(())
+        }
+        Step::Register => register_uninstall(&opts.dir, &exe),
+        Step::Launcher => {
+            if opts.no_uac {
+                tasks::create(
+                    tasks::LAUNCHER,
+                    &exe,
+                    "",
+                    false,
+                    "Переключатель DNS: открывает программу с правами администратора без запроса UAC.",
+                )
+            } else {
+                tasks::remove(tasks::LAUNCHER)
+            }
+        }
+        Step::Background => {
+            let mut cfg = Config::load();
+            cfg.failover.background = opts.background;
+            if opts.background {
+                cfg.failover.enabled = true;
+            }
+            cfg.save()?;
+            let result = if opts.background { monitor::install_task_for(&exe) } else { monitor::remove_task() };
+            state::log(&format!("Установлена версия {VERSION} в {}.", opts.dir.display()));
+            result
+        }
+        _ => Ok(()),
+    }
+}
+
+pub fn run_uninstall_step(step: Step, dir: Option<&Path>) -> Result<(), String> {
+    match step {
+        Step::StopRunning => {
+            stop_other_instances();
+            Ok(())
+        }
+        Step::RemoveTasks => tasks::remove(tasks::WATCHDOG).and(tasks::remove(tasks::LAUNCHER)),
+        Step::ResetDns => {
+            let st = RuntimeState::load();
+            let adapters: Vec<_> = net::list_adapters()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| st.adapters.contains(&a.guid))
+                .collect();
+            let outcomes = apply::run(&Action::Reset, &adapters);
+            let _ = RuntimeState::default().save();
+            match outcomes.iter().find_map(|o| o.result.as_ref().err()) {
+                Some(e) => Err(format!("DNS не сброшен: {e}")),
+                None => Ok(()),
+            }
+        }
+        Step::RemoveShortcuts => {
+            let _ = std::fs::remove_file(start_menu_link());
+            let _ = std::fs::remove_file(desktop_link());
+            Ok(())
+        }
+        Step::Unregister => {
+            state::log("Программа удалена.");
+            match RegKey::predef(HKEY_LOCAL_MACHINE).delete_subkey_all(UNINSTALL_KEY) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("Не удалось убрать запись: {e}")),
+                _ => Ok(()),
+            }
+        }
+        Step::RemoveSettings => match std::fs::remove_dir_all(data_dir()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("Не удалось удалить настройки: {e}")),
+            _ => Ok(()),
+        },
+        Step::RemoveFiles => {
+            // Папку запоминает мастер до начала: запись в реестре к этому шагу уже удалена.
+            let Some(dir) = dir else { return Ok(()) };
+            if running_from(dir) {
+                schedule_dir_removal(dir);
+                Ok(())
+            } else {
+                match std::fs::remove_dir_all(dir) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        Err(format!("Не удалось удалить {}: {e}", dir.display()))
+                    }
+                    _ => Ok(()),
+                }
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn running_from(dir: &Path) -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| same_path(p, dir)))
+        .unwrap_or(false)
+}
+
+/// Свой exe удалить нельзя, пока он работает: cmd удалит папку после выхода,
+/// повторяя попытки до двух минут.
+fn schedule_dir_removal(dir: &Path) {
+    let d = dir.display();
+    let cmd = format!(
+        "for /L %i in (1,1,120) do @(if exist \"{d}\" (rmdir /s /q \"{d}\" 2>nul & ping -n 2 127.0.0.1 >nul))"
+    );
+    let _ = Command::new("cmd")
+        .args(["/C", &cmd])
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn();
+}
+
 /// Останавливает фоновое задание и другие копии программы, чтобы exe можно было заменить.
 fn stop_other_instances() {
-    let _ = apply::run_tool("schtasks", &["/End", "/TN", monitor::TASK_NAME]);
+    let _ = apply::run_tool("schtasks", &["/End", "/TN", tasks::WATCHDOG]);
     let pid_filter = format!("PID ne {}", std::process::id());
     let _ = apply::run_tool("taskkill", &["/F", "/IM", EXE_NAME, "/FI", &pid_filter]);
     std::thread::sleep(std::time::Duration::from_millis(700));
 }
 
-pub fn install(desktop_shortcut: bool) -> Result<(), String> {
+fn copy_self(dir: &Path, target: &Path) -> Result<(), String> {
     let source = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dir = install_dir();
-    let target = installed_exe();
-    stop_other_instances();
-
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Не удалось создать {}: {e}", dir.display()))?;
-    if !same_path(&source, &target) {
-        let mut last_err = None;
-        for _ in 0..10 {
-            match std::fs::copy(&source, &target) {
-                Ok(_) => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                }
+    std::fs::create_dir_all(dir).map_err(|e| format!("Не удалось создать {}: {e}", dir.display()))?;
+    if same_path(&source, target) {
+        return Ok(());
+    }
+    let mut last_err = None;
+    for _ in 0..10 {
+        match std::fs::copy(&source, target) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(400));
             }
         }
-        if let Some(e) = last_err {
-            return Err(format!("Не удалось скопировать программу в {}: {e}", dir.display()));
-        }
     }
-
-    register_uninstall(&target)?;
-    create_shortcut(&start_menu_link(), &target)?;
-    if desktop_shortcut {
-        create_shortcut(&desktop_link(), &target)?;
-    }
-
-    // Фоновое задание указывает на exe; пересоздаём его, чтобы оно смотрело на новую копию.
-    if monitor::task_installed() {
-        monitor::install_task_for(&target)?;
-    }
-    state::log(&format!("Установлена версия {VERSION} в {}.", dir.display()));
-    Ok(())
+    Err(format!(
+        "Не удалось скопировать программу в {}: {}. Закройте её, если она открыта, и нажмите «Повторить».",
+        dir.display(),
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    ))
 }
 
-fn register_uninstall(exe: &Path) -> Result<(), String> {
+fn register_uninstall(dir: &Path, exe: &Path) -> Result<(), String> {
     let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
         .create_subkey(UNINSTALL_KEY)
         .map_err(|e| format!("Не удалось записать сведения об установке: {e}"))?;
@@ -120,7 +318,7 @@ fn register_uninstall(exe: &Path) -> Result<(), String> {
         .and_then(|_| set("DisplayVersion", VERSION))
         .and_then(|_| set("Publisher", "DnsSwitcher"))
         .and_then(|_| set("DisplayIcon", &exe_text))
-        .and_then(|_| set("InstallLocation", &install_dir().to_string_lossy()))
+        .and_then(|_| set("InstallLocation", &dir.to_string_lossy()))
         .and_then(|_| set("UninstallString", &format!("\"{exe_text}\" --uninstall")))
         .and_then(|_| key.set_value("NoModify", &1u32))
         .and_then(|_| key.set_value("NoRepair", &1u32))
@@ -144,64 +342,10 @@ fn create_shortcut(link: &Path, target: &Path) -> Result<(), String> {
 }
 
 /// Запускает установленную программу отдельно от установщика.
-pub fn launch_installed() -> Result<(), String> {
-    Command::new(installed_exe())
+pub fn launch(dir: &Path) -> Result<(), String> {
+    Command::new(dir.join(EXE_NAME))
         .creation_flags(DETACHED_PROCESS)
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("Не удалось запустить программу: {e}"))
-}
-
-// ---------- Удаление ----------
-
-fn message(text: &str, flags: u32) -> i32 {
-    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
-    let (text, title) = (wide(text), wide(APP_NAME));
-    unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), flags) }
-}
-
-/// `dns-switcher.exe --uninstall`, вызывается из «Приложений» Windows.
-pub fn uninstall_interactive() {
-    let ask = format!("Удалить «{APP_NAME}»?\n\nСписок серверов и журнал в %APPDATA%\\DnsSwitcher останутся.");
-    if message(&ask, MB_YESNO | MB_ICONQUESTION) != IDYES {
-        return;
-    }
-
-    let st = RuntimeState::load();
-    let managed = st.active.is_some() || st.on_dhcp_fallback;
-    let reset_dns = managed
-        && message(
-            "Вернуть DNS подключений на автоматический (от роутера или провайдера)?\n\n\
-             «Нет» оставит текущие DNS-серверы. Защита от сбоев после удаления работать не будет.",
-            MB_YESNO | MB_ICONQUESTION,
-        ) == IDYES;
-
-    let _ = monitor::remove_task();
-    stop_other_instances();
-    if reset_dns {
-        let adapters: Vec<_> = net::list_adapters()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|a| st.adapters.contains(&a.guid))
-            .collect();
-        apply::run(&Action::Reset, &adapters);
-        let _ = RuntimeState::default().save();
-    }
-    let _ = std::fs::remove_file(start_menu_link());
-    let _ = std::fs::remove_file(desktop_link());
-    let _ = RegKey::predef(HKEY_LOCAL_MACHINE).delete_subkey_all(UNINSTALL_KEY);
-    state::log("Программа удалена.");
-
-    // Свой exe удалить нельзя, пока он работает: папку удалит cmd через пару секунд.
-    let dir = install_dir();
-    if running_installed() {
-        let cmd = format!("ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"", dir.display());
-        let _ = Command::new("cmd")
-            .args(["/C", &cmd])
-            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-            .spawn();
-    } else {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    message(&format!("«{APP_NAME}» удалён."), MB_OK | MB_ICONINFORMATION);
 }

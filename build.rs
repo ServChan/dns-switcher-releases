@@ -2,14 +2,9 @@ use embed_manifest::manifest::{DpiAwareness, ExecutionLevel};
 use embed_manifest::{embed_manifest, new_manifest};
 
 fn main() {
-    // Смена DNS требует прав администратора, поэтому Windows сразу спросит их при запуске.
-    // DNS_SWITCHER_AS_INVOKER=1 собирает версию без запроса прав (для отладки интерфейса).
-    println!("cargo:rerun-if-env-changed=DNS_SWITCHER_AS_INVOKER");
-    let level = if std::env::var_os("DNS_SWITCHER_AS_INVOKER").is_some() {
-        ExecutionLevel::AsInvoker
-    } else {
-        ExecutionLevel::RequireAdministrator
-    };
+    // Права администратора программа запрашивает сама при запуске (src/elevate.rs):
+    // так ярлык может открывать её через задание Планировщика без окна UAC.
+    let level = ExecutionLevel::AsInvoker;
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         embed_manifest(
             new_manifest("DnsSwitcher")

@@ -151,7 +151,7 @@ impl DnsApp {
 
         // Окно тоже следит за DNS, если фоновое задание не делает это само.
         let watch_stop = Arc::new(AtomicBool::new(false));
-        if crate::is_admin() {
+        if crate::elevate::is_admin() {
             let stop = watch_stop.clone();
             std::thread::spawn(move || monitor::run_loop(stop, true));
         }
@@ -178,7 +178,7 @@ impl DnsApp {
             last_sweep: Instant::now(),
             tx,
             rx,
-            is_admin: crate::is_admin(),
+            is_admin: crate::elevate::is_admin(),
             _watch_stop: watch_stop,
         };
         app.refresh_adapters();
@@ -287,7 +287,7 @@ impl DnsApp {
     /// Почему сейчас нельзя менять DNS, если нельзя.
     fn blocker(&self) -> Option<&'static str> {
         if !self.is_admin {
-            Some("Нужны права администратора. Перезапустите программу через «Запуск от имени администратора».")
+            Some("Нужны права администратора: нажмите «Перезапустить с правами администратора» вверху окна.")
         } else if self.chosen.is_empty() {
             Some("Отметьте сверху хотя бы одно подключение.")
         } else {
@@ -522,14 +522,15 @@ impl DnsApp {
             self.protection_line(ui, p);
 
             if !self.is_admin {
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "Программа запущена без прав администратора и не сможет менять DNS. \
-                         Закройте её и запустите через «Запуск от имени администратора».",
-                    )
-                    .color(p.warn_text),
-                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Нет прав администратора, поэтому DNS менять нельзя.").color(p.warn_text));
+                    if ui.button("Перезапустить с правами администратора").clicked()
+                        && crate::elevate::relaunch_as_admin(&["--wait-gui".to_string()]).is_ok()
+                    {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
             }
             if let Some(e) = &self.adapter_error {
                 ui.label(RichText::new(format!("Не удалось прочитать подключения: {e}")).color(p.danger_text));

@@ -11,6 +11,7 @@ use crate::config::{Config, DnsServer, LastResort};
 use crate::health;
 use crate::net::{self, Adapter};
 use crate::state::{self, RuntimeState};
+use crate::tasks;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -295,88 +296,29 @@ fn go_dhcp(st: &mut RuntimeState, adapters: &[Adapter], reason: &str) {
 
 // ---------- Фоновое задание ----------
 
-pub const TASK_NAME: &str = "DnsSwitcher Watchdog";
-
 pub fn task_installed() -> bool {
-    apply::run_tool("schtasks", &["/Query", "/TN", TASK_NAME]).is_ok()
+    tasks::exists(tasks::WATCHDOG)
 }
 
-/// Создаёт задание «при входе в Windows» с наивысшими правами и сразу запускает его.
+/// Создаёт задание «при входе в Windows» для текущего exe и сразу запускает его.
 pub fn install_task() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     install_task_for(&exe)
 }
 
 pub fn install_task_for(exe: &std::path::Path) -> Result<(), String> {
-    let user = format!(
-        "{}\\{}",
-        std::env::var("USERDOMAIN").unwrap_or_default(),
-        std::env::var("USERNAME").unwrap_or_default()
-    );
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>Переключатель DNS: проверяет DNS-серверы и переключает на резервный при сбое.</Description>
-  </RegistrationInfo>
-  <Triggers>
-    <LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <UserId>{user}</UserId>
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
-  </Settings>
-  <Actions Context="Author">
-    <Exec><Command>{}</Command><Arguments>--watch</Arguments></Exec>
-  </Actions>
-</Task>
-"#,
-        xml_escape(&exe.to_string_lossy()),
-        user = xml_escape(&user),
-    );
-
-    // schtasks принимает XML в UTF-16 с BOM.
-    let path = std::env::temp_dir().join("dns-switcher-task.xml");
-    let mut bytes = vec![0xFF, 0xFE];
-    for unit in xml.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
-    let path_text = path.to_string_lossy().to_string();
-    let created = apply::run_tool("schtasks", &["/Create", "/TN", TASK_NAME, "/XML", &path_text, "/F"]);
-    let _ = std::fs::remove_file(&path);
-    created.map_err(|e| format!("Не удалось создать задание в Планировщике: {e}"))?;
-    apply::run_tool("schtasks", &["/Run", "/TN", TASK_NAME])
-        .map_err(|e| format!("Задание создано, но не запустилось: {e}"))
+    tasks::create(
+        tasks::WATCHDOG,
+        exe,
+        "--watch",
+        true,
+        "Переключатель DNS: проверяет DNS-серверы и переключает на резервный при сбое.",
+    )?;
+    tasks::run(tasks::WATCHDOG).map_err(|e| format!("Задание создано, но не запустилось: {e}"))
 }
 
 pub fn remove_task() -> Result<(), String> {
-    let _ = apply::run_tool("schtasks", &["/End", "/TN", TASK_NAME]);
-    apply::run_tool("schtasks", &["/Delete", "/TN", TASK_NAME, "/F"])
-        .map_err(|e| format!("Не удалось удалить задание из Планировщика: {e}"))
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    tasks::remove(tasks::WATCHDOG)
 }
 
 #[cfg(test)]

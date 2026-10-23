@@ -207,7 +207,7 @@ fn h2_post(tls: &mut Tls, host: &str, path: &str, message: &[u8]) -> Result<Vec<
 fn describe_io(e: &std::io::Error) -> String {
     match e.kind() {
         ErrorKind::TimedOut | ErrorKind::WouldBlock => "нет ответа".into(),
-        ErrorKind::InvalidData => format!("ошибка TLS: {e}"),
+        ErrorKind::InvalidData => crate::health::tls_error_text(e),
         _ => e.to_string(),
     }
 }

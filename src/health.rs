@@ -31,6 +31,22 @@ const QTYPE_A: u16 = 1;
 const QTYPE_AAAA: u16 = 28;
 /// Сколько прокси из ответа проверять у одного сервиса.
 const MAX_PROXIES: usize = 8;
+/// Сколько TLS-соединений открывать одновременно при полной проверке.
+const FULL_PARALLEL: usize = 3;
+/// Сколько прокси перебирать в обычной проверке до вывода «сервис не открывается».
+const QUICK_PROXIES: usize = 4;
+
+/// Насколько подробно проверять. Обычная проверка бережная: прокси пробуются по
+/// одному до первого рабочего, сервисы по очереди. Десятки одновременных
+/// TLS-соединений сеть может принять за подозрительные и портить их, и тогда
+/// здоровый сервер выглядит сломанным.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Depth {
+    /// Для защиты и периодических проверок: «открывается ли сервис».
+    Quick,
+    /// По кнопке «Проверить»: каждый прокси, не больше трёх соединений сразу.
+    Full,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Method {
@@ -214,7 +230,7 @@ fn probe_ips(server: &DnsServer) -> Vec<String> {
 
 /// Проверяет все адреса сервера параллельно, а для серверов обхода ИИ ещё и
 /// включённые сервисы из `probes`.
-pub fn check(server: &DnsServer, use_doh: bool, probes: &[Probe]) -> Health {
+pub fn check(server: &DnsServer, use_doh: bool, probes: &[Probe], depth: Depth) -> Health {
     let method = method_for(server, use_doh);
     let template = server.doh.clone();
     let handles: Vec<_> = probe_ips(server)
@@ -232,33 +248,47 @@ pub fn check(server: &DnsServer, use_doh: bool, probes: &[Probe]) -> Health {
         .collect();
     let ips: Vec<IpHealth> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
 
-    // Сервисы спрашиваем у самого быстрого рабочего адреса: его Windows и выберет.
-    let fastest = ips
+    // Сервисы спрашиваем у рабочих адресов DNS начиная с самого быстрого: его Windows
+    // и выберет, а остальные подстрахуют, если запрос к нему сорвётся.
+    let mut working: Vec<(u32, IpAddr)> = ips
         .iter()
-        .filter_map(|h| h.result.as_ref().ok().map(|ms| (*ms, h.ip.clone())))
-        .min()
-        .and_then(|(_, ip)| ip.parse::<IpAddr>().ok());
-    let services = match (server.ai_bypass, fastest) {
-        (true, Some(dns_ip)) => {
-            let handles: Vec<_> = probes
-                .iter()
-                .filter(|p| p.enabled)
-                .cloned()
-                .map(|p| {
-                    let template = template.clone();
-                    std::thread::spawn(move || check_service(p.name, p.domain, dns_ip, method, &template))
-                })
-                .collect();
-            handles.into_iter().filter_map(|h| h.join().ok()).collect()
-        }
+        .filter_map(|h| Some((*h.result.as_ref().ok()?, h.ip.parse::<IpAddr>().ok()?)))
+        .collect();
+    working.sort();
+    let dns_ips: Vec<IpAddr> = working.into_iter().map(|(_, ip)| ip).collect();
+    // Сервисы по очереди: так в каждый момент открыто не больше нескольких соединений.
+    let services = match (server.ai_bypass, dns_ips.is_empty()) {
+        (true, false) => probes
+            .iter()
+            .filter(|p| p.enabled)
+            .map(|p| check_service(p.name.clone(), p.domain.clone(), &dns_ips, method, &template, depth))
+            .collect(),
         _ => Vec::new(),
     };
     Health { method, ips, services }
 }
 
-fn check_service(name: String, domain: String, dns_ip: IpAddr, method: Method, template: &str) -> ServiceHealth {
+fn check_service(
+    name: String,
+    domain: String,
+    dns_ips: &[IpAddr],
+    method: Method,
+    template: &str,
+    depth: Depth,
+) -> ServiceHealth {
     let mut out = ServiceHealth { name, domain: domain.clone(), proxied: None, ipv6_leak: false, dns_error: None, proxies: Vec::new() };
-    let addrs = match resolve(dns_ip, method, template, &domain) {
+    // Запрос по DoH сам идёт по TLS и иногда портится в сети: повторяем и пробуем
+    // другие адреса сервера, прежде чем считать, что адреса сервиса нет.
+    let mut answer = Err("нет ответа".to_string());
+    let mut dns_ip = dns_ips[0];
+    for &ip in dns_ips {
+        answer = retry(2, || resolve(ip, method, template, &domain));
+        dns_ip = ip;
+        if answer.is_ok() {
+            break;
+        }
+    }
+    let addrs = match answer {
         Ok((_, addrs)) if addrs.is_empty() => {
             out.dns_error = Some("DNS не дал адресов".into());
             return out;
@@ -285,16 +315,49 @@ fn check_service(name: String, domain: String, dns_ip: IpAddr, method: Method, t
             out.ipv6_leak = v6.iter().any(|a| real6.contains(a));
         }
     }
-    let handles: Vec<_> = addrs
-        .into_iter()
-        .take(MAX_PROXIES)
-        .map(|addr| {
-            let domain = domain.clone();
-            std::thread::spawn(move || (addr, retry_once(|| tls_probe(addr, &domain))))
-        })
-        .collect();
-    out.proxies = handles.into_iter().filter_map(|h| h.join().ok()).collect();
+    let addrs: Vec<Ipv4Addr> = addrs.into_iter().take(MAX_PROXIES).collect();
+    match depth {
+        // По одному до первого рабочего: браузер тоже идёт к одному прокси.
+        Depth::Quick => {
+            for addr in addrs.into_iter().take(QUICK_PROXIES) {
+                // До трёх попыток: в сети бывают одиночные испорченные рукопожатия,
+                // а у некоторых серверов прокси всего один.
+                let result = retry(3, || tls_probe(addr, &domain));
+                let ok = result.is_ok();
+                out.proxies.push((addr, result));
+                if ok {
+                    break;
+                }
+            }
+        }
+        Depth::Full => {
+            for chunk in addrs.chunks(FULL_PARALLEL) {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|&addr| {
+                        let domain = domain.clone();
+                        std::thread::spawn(move || (addr, retry_once(|| tls_probe(addr, &domain))))
+                    })
+                    .collect();
+                out.proxies.extend(handles.into_iter().filter_map(|h| h.join().ok()));
+            }
+        }
+    }
     out
+}
+
+/// Ошибка TLS по-русски и коротко: исходные тексты rustls длинные и английские.
+pub fn tls_error_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    if text.contains("InvalidContentType") || text.contains("corrupt message") {
+        "ответ не похож на TLS: соединение испорчено по пути".into()
+    } else if text.contains("certificate") || text.contains("Certificate") {
+        "чужой сертификат: соединение подменено".into()
+    } else if text.contains("alert") || text.contains("Alert") {
+        "сервер прервал защищённое соединение".into()
+    } else {
+        "ошибка защищённого соединения".into()
+    }
 }
 
 /// Ответ эталонного DNS (Cloudflare, затем Google) по DoH. Кэшируется на 10 минут.
@@ -398,7 +461,7 @@ fn tls_probe(addr: Ipv4Addr, domain: &str) -> Result<u32, String> {
     while tls.conn.is_handshaking() {
         tls.conn.complete_io(&mut tls.sock).map_err(|e| match e.kind() {
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => "TLS не завершился".to_string(),
-            std::io::ErrorKind::InvalidData => format!("ошибка TLS: {e}"),
+            std::io::ErrorKind::InvalidData => tls_error_text(&e),
             _ => "соединение сброшено".to_string(),
         })?;
     }
@@ -407,11 +470,30 @@ fn tls_probe(addr: Ipv4Addr, domain: &str) -> Result<u32, String> {
 
 /// Повторяет неудачную проверку один раз: разовые сбои сети (сброс соединения,
 /// испорченный TLS-пакет) не должны выглядеть как отказ сервера.
-fn retry_once<T>(mut f: impl FnMut() -> Result<T, String>) -> Result<T, String> {
-    f().or_else(|_| {
-        std::thread::sleep(Duration::from_millis(300));
-        f()
-    })
+fn retry_once<T>(f: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    retry(2, f)
+}
+
+/// До `attempts` попыток с паузой 400 мс; возвращает первую удачу или последнюю ошибку.
+/// Повторяются только быстрые случайные сбои (испорченный TLS, сброс соединения):
+/// если адрес не отвечает вовсе, повтор лишь затянул бы проверку на секунды.
+fn retry<T>(attempts: u32, mut f: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    let mut last = f();
+    for _ in 1..attempts {
+        match &last {
+            Ok(_) => break,
+            Err(e) if is_silence(e) => break,
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        last = f();
+    }
+    last
+}
+
+/// Ошибка «адрес молчит»: повторять бесполезно.
+fn is_silence(e: &str) -> bool {
+    ["не отвечает", "нет ответа", "нет соединения", "не завершился"].iter().any(|w| e.contains(w))
 }
 
 /// Запрос любого типа: адреса из ответа (A или AAAA).
@@ -594,6 +676,37 @@ mod tests {
     }
 
     #[test]
+    fn retry_repeats_flaky_errors_but_not_silence() {
+        let mut calls = 0;
+        let r: Result<(), String> = retry(3, || {
+            calls += 1;
+            Err("ответ не похож на TLS: соединение испорчено по пути".into())
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 3);
+        let mut calls = 0;
+        let _ = retry::<()>(3, || {
+            calls += 1;
+            Err("прокси не отвечает".into())
+        });
+        assert_eq!(calls, 1);
+        let mut calls = 0;
+        let r = retry(3, || {
+            calls += 1;
+            if calls < 2 { Err("соединение сброшено".to_string()) } else { Ok(calls) }
+        });
+        assert_eq!(r, Ok(2));
+    }
+
+    #[test]
+    fn tls_errors_are_short_and_russian() {
+        let e = std::io::Error::new(std::io::ErrorKind::InvalidData, "received corrupt message of type InvalidContentType");
+        assert_eq!(tls_error_text(&e), "ответ не похож на TLS: соединение испорчено по пути");
+        let e = std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid peer certificate: UnknownIssuer");
+        assert_eq!(tls_error_text(&e), "чужой сертификат: соединение подменено");
+    }
+
+    #[test]
     fn grades_from_best_to_worst() {
         assert_eq!(health(Some(50), vec![svc(&[Ok(80)])]).grade(), Grade::Good);
         assert_eq!(health(Some(50), vec![svc(&[Ok(80), Err("x".into())])]).grade(), Grade::PartialProxies);
@@ -606,6 +719,43 @@ mod tests {
         assert_eq!(health(Some(50), vec![not_proxied]).grade(), Grade::ServiceDown);
     }
 
+    /// Сколько раз бережная проверка ошибочно признаёт рабочий сервер сломанным:
+    /// `cargo test -- --ignored --nocapture live_quick_stability`.
+    #[test]
+    #[ignore]
+    fn live_quick_stability() {
+        let probes = crate::config::default_probes();
+        for name in ["GeoHide EU", "MagicDNS"] {
+            let server = default_servers().into_iter().find(|s| s.name == name).unwrap();
+            let mut bad = Vec::new();
+            for _ in 0..20 {
+                let h = check(&server, true, &probes, Depth::Quick);
+                if !h.grade().acceptable() {
+                    bad.push(h.problem().unwrap_or_default());
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            println!("{name}: плохих {} из 20 {:?}", bad.len(), bad);
+        }
+    }
+
+    /// Как распределены во времени сбои TLS: раз в секунду одно рукопожатие.
+    #[test]
+    #[ignore]
+    fn live_tls_burst_pattern() {
+        for (ip, domain) in [("37.221.93.128", "claude.ai"), ("37.221.93.128", "gemini.google.com"), ("94.249.177.102", "claude.ai")] {
+            let addr: Ipv4Addr = ip.parse().unwrap();
+            let line: String = (0..40)
+                .map(|_| {
+                    let ok = tls_probe(addr, domain).is_ok();
+                    std::thread::sleep(Duration::from_millis(1000));
+                    if ok { '+' } else { 'x' }
+                })
+                .collect();
+            println!("{ip} {domain:<18} {line}");
+        }
+    }
+
     /// Обращается к настоящим серверам: `cargo test -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -613,7 +763,9 @@ mod tests {
         println!("internet_ok = {}", internet_ok());
         let probes = crate::config::default_probes();
         for server in default_servers() {
-            let h = check(&server, true, &probes);
+            let started = Instant::now();
+            let h = check(&server, true, &probes, Depth::Quick);
+            println!("  ({:.1} с) {}", started.elapsed().as_secs_f32(), h.problem().unwrap_or_else(|| "работает".into()));
             let ips: Vec<String> = h
                 .ips
                 .iter()

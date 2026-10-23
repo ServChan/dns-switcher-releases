@@ -5,7 +5,7 @@ mod simple;
 use crate::apply::{self, Action, Outcome};
 use crate::browsers;
 use crate::config::{Config, DnsServer, Failover, LastResort, ThemeChoice, UiMode, default_servers, parse_ip_list};
-use crate::health::{self, EndToEnd, Grade, Health, Method};
+use crate::health::{self, Depth, EndToEnd, Grade, Health, Method};
 use crate::install;
 use crate::monitor;
 use crate::net::{self, Adapter};
@@ -440,20 +440,32 @@ impl DnsApp {
         });
     }
 
+    /// Перепроверка всех серверов: бережная, как у защиты.
     fn start_sweep(&mut self, ctx: &egui::Context) {
+        self.sweep_with(ctx, Depth::Quick);
+    }
+
+    /// «Проверить все»: каждый прокси каждого сервера.
+    fn start_full_sweep(&mut self, ctx: &egui::Context) {
+        self.sweep_with(ctx, Depth::Full);
+    }
+
+    fn sweep_with(&mut self, ctx: &egui::Context, depth: Depth) {
         self.last_sweep = Instant::now();
         let use_doh = self.config.use_doh;
-        for server in self.config.servers.clone() {
+        let servers = self.config.servers.clone();
+        for server in &servers {
             self.health.insert(server.name.clone(), HealthView::Running);
-            let tx = self.tx.clone();
-            let ctx = ctx.clone();
-            let probes = self.config.probes.clone();
-            std::thread::spawn(move || {
-                let health = health::check(&server, use_doh, &probes);
+        }
+        let (tx, ctx, probes) = (self.tx.clone(), ctx.clone(), self.config.probes.clone());
+        // Серверы по очереди: результат каждого появляется в окне сразу.
+        std::thread::spawn(move || {
+            for server in servers {
+                let health = health::check(&server, use_doh, &probes, depth);
                 let _ = tx.send(Msg::Health { name: server.name, health });
                 ctx.request_repaint();
-            });
-        }
+            }
+        });
     }
 
     fn set_background(&mut self, ctx: &egui::Context, enable: bool) {
@@ -819,11 +831,11 @@ impl DnsApp {
                 let text = if checking { "Проверяю…" } else { "Проверить все" };
                 if ui
                     .button(text)
-                    .on_hover_text("Проверить каждый адрес каждого сервера и показать время ответа.")
+                    .on_hover_text("Проверить каждый адрес и каждый прокси всех серверов.")
                     .clicked()
                     && !checking
                 {
-                    self.start_sweep(&ctx);
+                    self.start_full_sweep(&ctx);
                 }
             });
         });
@@ -1104,7 +1116,7 @@ impl DnsApp {
                             let (s, use_doh, ctx) = (server.clone(), self.config.use_doh, ctx.clone());
                             let probes = self.config.probes.clone();
                             std::thread::spawn(move || {
-                                let health = health::check(&s, use_doh, &probes);
+                                let health = health::check(&s, use_doh, &probes, Depth::Full);
                                 let _ = tx.send(Msg::Health { name: s.name, health });
                                 ctx.request_repaint();
                             });
@@ -1332,7 +1344,7 @@ impl DnsApp {
                         let (use_doh, ctx) = (self.config.use_doh, ctx.clone());
                         let probes = self.config.probes.clone();
                         std::thread::spawn(move || {
-                            let health = health::check(&server, use_doh, &probes);
+                            let health = health::check(&server, use_doh, &probes, Depth::Quick);
                             let _ = tx.send(Msg::Health { name: server.name, health });
                             ctx.request_repaint();
                         });

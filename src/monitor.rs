@@ -8,7 +8,7 @@
 
 use crate::apply::{self, Action};
 use crate::config::{Config, DnsServer, LastResort};
-use crate::health::{self, Grade, Health};
+use crate::health::{self, Depth, Grade, Health};
 use crate::net::{self, Adapter};
 use crate::state::{self, RuntimeState, Snapshot};
 use crate::{browsers, tasks, tray, update};
@@ -25,8 +25,14 @@ const LOCK_NAME: &str = "Local\\DnsSwitcherWatch";
 const SYNCHRONIZE: u32 = 0x0010_0000;
 /// Сколько проверок подряд сервер должен не отвечать, чтобы переключиться.
 const FAILS_TO_SWITCH: u32 = 2;
-/// Сколько проверок подряд выбранный сервер должен отвечать, чтобы к нему вернуться.
-const OKS_TO_RETURN: u32 = 2;
+/// Сколько проверок подряд выбранный сервер должен работать, чтобы к нему вернуться.
+/// Если он снова сломался вскоре после возврата, порог удваивается (до MAX_RETURN).
+const OKS_TO_RETURN: u32 = 3;
+const MAX_RETURN: u32 = 30;
+/// Сбой в течение этого времени после возврата считается «снова сбоит».
+const FLAP_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// Столько стабильной работы после возврата сбрасывает порог к обычному.
+const CALM_AFTER: Duration = Duration::from_secs(2 * 3600);
 /// Как часто проверять все серверы для истории надёжности.
 const SWEEP_EVERY: Duration = Duration::from_secs(300);
 /// Сколько последних оценок хранить на сервер.
@@ -145,6 +151,10 @@ struct Memory {
     browsers_told: String,
     ipv6_told: bool,
     snapshot: Snapshot,
+    /// Когда защита последний раз вернулась к выбранному серверу.
+    returned_at: Option<Instant>,
+    /// Сколько удачных проверок подряд нужно для возврата (растёт, если сервер сбоит).
+    return_needed: u32,
 }
 
 impl Watcher {
@@ -260,6 +270,27 @@ impl Watcher {
         us.save();
     }
 
+    /// Защита ушла с выбранного сервера. Если это случилось вскоре после возврата
+    /// к нему, сервер сбоит: в следующий раз возвращаемся только после более долгой
+    /// стабильной работы, чтобы не прыгать туда-обратно.
+    fn note_left_preferred(&mut self, left: &str, st: &RuntimeState) {
+        if st.preferred.as_deref() != Some(left) {
+            return;
+        }
+        let flapping = self.mem.returned_at.is_some_and(|t| t.elapsed() < FLAP_WINDOW);
+        self.mem.return_needed = if flapping {
+            (self.mem.return_needed.max(OKS_TO_RETURN) * 2).min(MAX_RETURN)
+        } else {
+            OKS_TO_RETURN
+        };
+        if flapping {
+            state::log(&format!(
+                "«{left}» снова сбоит вскоре после возврата. Верну его, только когда он проработает без сбоев {} проверок подряд.",
+                self.mem.return_needed
+            ));
+        }
+    }
+
     fn tick(&mut self, cfg: &Config) {
         self.check_browsers(cfg);
         self.check_updates(cfg);
@@ -315,8 +346,10 @@ impl Watcher {
             return;
         }
 
-        let health = health::check(&active, cfg.use_doh, &cfg.probes);
+        let health = health::check(&active, cfg.use_doh, &cfg.probes, Depth::Quick);
         let mut grade = health.grade();
+        // Причина, когда сбой нашла сквозная проверка, а не проверка самого сервера.
+        let mut forced_reason: Option<String> = None;
         self.remember(&active.name, grade);
 
         // IPv6: сервер отдаёт настоящий адрес, а у подключения есть IPv6 — обход течёт.
@@ -364,6 +397,7 @@ impl Watcher {
                     } else {
                         state::log(&format!("«{}» — {why}, повторное применение не помогло.", active.name));
                         grade = Grade::Slow;
+                        forced_reason = Some(why.to_string());
                     }
                 }
             }
@@ -373,6 +407,11 @@ impl Watcher {
         if grade.acceptable() {
             if self.fail_streak > 0 {
                 state::log(&format!("«{}» снова работает нормально.", active.name));
+            }
+            // Долго без сбоев после возврата: порог возврата снова обычный.
+            if st.active == st.preferred && self.mem.returned_at.is_some_and(|t| t.elapsed() > CALM_AFTER) {
+                self.mem.return_needed = OKS_TO_RETURN;
+                self.mem.returned_at = None;
             }
             self.fail_streak = 0;
             self.offline_logged = false;
@@ -394,7 +433,10 @@ impl Watcher {
         }
         self.offline_logged = false;
         self.fail_streak += 1;
-        let reason = health.problem().unwrap_or_default();
+        let reason = match &forced_reason {
+            Some(r) => r.clone(),
+            None => health.problem().unwrap_or_default(),
+        };
         if self.fail_streak < FAILS_TO_SWITCH {
             state::log(&format!(
                 "«{}» — {reason}. Перепроверю через {} с.",
@@ -411,6 +453,7 @@ impl Watcher {
         }
         if let Some((s, h)) = best(&checked, grade, |n| self.history_rank(n)) {
             if switch_to(cfg, &mut st, &adapters, &health::prefer_working(&s, &h)) {
+                self.note_left_preferred(&active.name, &st);
                 state::log(&format!("Переключено с «{}» на «{}». Причина: «{}» — {reason}.", active.name, s.name, active.name));
                 state::log(&choice_note(&s.name, &h, &checked));
                 if cfg.notify.switches {
@@ -471,14 +514,16 @@ impl Watcher {
     /// Вернуться к выбранному вручную серверу, если он стабильно работает.
     fn try_return(&mut self, cfg: &Config, st: &mut RuntimeState, adapters: &[Adapter]) {
         let Some(preferred) = st.preferred.as_ref().and_then(|n| cfg.find(n)).cloned() else { return };
-        let h = health::check(&preferred, cfg.use_doh, &cfg.probes);
+        let h = health::check(&preferred, cfg.use_doh, &cfg.probes, Depth::Quick);
         if h.grade().acceptable() {
             self.return_streak += 1;
         } else {
             self.return_streak = 0;
         }
-        if self.return_streak >= OKS_TO_RETURN && switch_to(cfg, st, adapters, &health::prefer_working(&preferred, &h)) {
+        let needed = self.mem.return_needed.max(OKS_TO_RETURN);
+        if self.return_streak >= needed && switch_to(cfg, st, adapters, &health::prefer_working(&preferred, &h)) {
             self.return_streak = 0;
+            self.mem.returned_at = Some(Instant::now());
             state::log(&format!("«{}» снова работает, вернул его.", preferred.name));
             if cfg.notify.switches {
                 tray::notify(&format!("Снова «{}»", preferred.name), "Выбранный вами сервер снова работает.", false);
@@ -545,19 +590,13 @@ pub(crate) fn candidates_note(checked: &[(DnsServer, Health)], skip: Option<&str
 }
 
 /// Проверяет серверы параллельно, порядок списка сохраняется.
+/// Проверяет серверы по очереди, порядок списка сохраняется. По очереди, а не все
+/// сразу: всплеск соединений сеть портит, и сравнение выходит нечестным.
 pub(crate) fn check_all(cfg: &Config, servers: &[DnsServer]) -> Vec<(DnsServer, Health)> {
-    let handles: Vec<_> = servers
+    servers
         .iter()
-        .cloned()
-        .map(|s| {
-            let (use_doh, probes) = (cfg.use_doh, cfg.probes.clone());
-            std::thread::spawn(move || {
-                let h = health::check(&s, use_doh, &probes);
-                (s, h)
-            })
-        })
-        .collect();
-    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        .map(|s| (s.clone(), health::check(s, cfg.use_doh, &cfg.probes, Depth::Quick)))
+        .collect()
 }
 
 /// Лучший сервер с оценкой строже `than`. При равной оценке выигрывает более
@@ -709,6 +748,23 @@ mod tests {
         let reason = fake("MagicDNS", None, true).1.problem().unwrap();
         assert_eq!(reason, "не отвечает: нет ответа");
         assert!(!reason.contains('('));
+    }
+
+    #[test]
+    fn return_threshold_grows_when_server_keeps_failing() {
+        let st = RuntimeState { preferred: Some("A".into()), active: Some("A".into()), ..Default::default() };
+        let mut w = Watcher::default();
+        w.note_left_preferred("A", &st);
+        assert_eq!(w.mem.return_needed, OKS_TO_RETURN, "первый сбой: обычный порог");
+        // Вернулись и почти сразу снова ушли: порог растёт до предела.
+        for expected in [6, 12, 24, MAX_RETURN, MAX_RETURN] {
+            w.mem.returned_at = Some(Instant::now());
+            w.note_left_preferred("A", &st);
+            assert_eq!(w.mem.return_needed, expected);
+        }
+        // Уход с резервного сервера порог не трогает.
+        w.note_left_preferred("B", &st);
+        assert_eq!(w.mem.return_needed, MAX_RETURN);
     }
 
     #[test]

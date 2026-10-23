@@ -108,6 +108,13 @@ impl DnsApp {
                     .into(),
             );
         }
+        if self.chosen.is_empty() && self.adapters.iter().any(|a| a.up) {
+            return (
+                NodeState::Warn,
+                "Подключение не выбрано".into(),
+                "Отметьте подключение к интернету в списке подключений: программа будет менять DNS на нём.".into(),
+            );
+        }
         if self.chosen_adapters().iter().all(|a| !a.up) {
             return (
                 NodeState::Warn,

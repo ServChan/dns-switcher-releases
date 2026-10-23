@@ -330,26 +330,50 @@ pub fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("Не удалось создать папку настроек: {e}"))?;
     }
-    let tmp = path.with_extension("tmp");
+    // Своё имя у каждой записи: окно и фоновая защита пишут одновременно.
+    let tmp = path.with_extension(format!("{}.tmp", crate::sys::random_suffix()));
     std::fs::write(&tmp, text)
         .and_then(|_| std::fs::rename(&tmp, path))
-        .map_err(|e| format!("Не удалось сохранить {}: {e}", path.display()))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("Не удалось сохранить {}: {e}", path.display())
+        })
 }
 
 impl Config {
     pub fn load() -> Self {
-        let mut cfg: Self = std::fs::read_to_string(config_path())
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
+        let path = config_path();
+        let mut cfg: Self = match std::fs::read_to_string(&path) {
+            Err(_) => Self::default(),
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    // Испорченный файл не затираем молча: свой список серверов
+                    // можно будет восстановить из копии.
+                    let broken = path.with_extension("broken.json");
+                    if !broken.exists() {
+                        let _ = std::fs::copy(&path, &broken);
+                        crate::state::log(&format!(
+                            "Файл настроек повреждён ({e}), загружены стандартные. Копия: {}.",
+                            broken.display()
+                        ));
+                    }
+                    Self::default()
+                }
+            },
+        };
         if cfg.migrate() {
             let _ = cfg.save();
             // Выбранный сервер мог называться «GeoHide DNS».
             let mut st = crate::state::RuntimeState::load();
             let mut renamed = false;
             for slot in [&mut st.preferred, &mut st.active] {
-                if slot.as_deref() == Some("GeoHide DNS") {
-                    *slot = Some(if cfg.find("GeoHide RU").is_some() { "GeoHide RU" } else { "GeoHide EU" }.into());
+                // Прежний «GeoHide DNS» стал пулом RU; если его в списке нет
+                // (список заменён новым), подходящая замена — EU.
+                let gone = |n: &str| cfg.find(n).is_none();
+                if let Some(old) = slot.as_deref().filter(|n| *n == "GeoHide DNS" || (*n == "GeoHide RU" && gone(n))) {
+                    let new = if old == "GeoHide DNS" && !gone("GeoHide RU") { "GeoHide RU" } else { "GeoHide EU" };
+                    *slot = Some(new.into());
                     renamed = true;
                 }
             }
@@ -415,6 +439,26 @@ impl Config {
 
     pub fn find(&self, name: &str) -> Option<&DnsServer> {
         self.servers.iter().find(|s| s.name == name)
+    }
+
+    /// Переносит в этот список то, что обновление подписанного списка сделало
+    /// в `disk`: новые адреса нетронутых стандартных серверов, добавленные и убранные
+    /// стандартные серверы. Свои правки этого списка остаются.
+    pub fn merge_remote_list(&mut self, disk: &Config) {
+        let untouched = |s: &DnsServer| s.builtin && !s.edited;
+        self.servers.retain(|s| !untouched(s) || disk.servers.iter().any(|d| d.name == s.name));
+        for s in self.servers.iter_mut().filter(|s| untouched(s)) {
+            if let Some(d) = disk.servers.iter().find(|d| d.name == s.name && untouched(d)) {
+                *s = d.clone();
+            }
+        }
+        for d in disk.servers.iter().filter(|d| untouched(d)) {
+            if self.find(&d.name).is_none() && !self.hidden_builtin.contains(&d.name) {
+                let at = self.servers.iter().rposition(|s| s.ai_bypass == d.ai_bypass).map(|i| i + 1).unwrap_or(self.servers.len());
+                self.servers.insert(at, d.clone());
+            }
+        }
+        self.remote_list_version = disk.remote_list_version;
     }
 
     /// Применяет подписанный список с сервера. Трогает только стандартные серверы,
@@ -541,6 +585,32 @@ mod tests {
         assert!(fresh < first_regular, "новый сервер для ИИ встаёт в свою группу");
         assert!(!changes.is_empty());
         assert!(cfg.apply_server_list(&list, &[]).is_empty(), "та же версия второй раз не применяется");
+    }
+
+    #[test]
+    fn merge_keeps_window_edit_and_takes_list_update() {
+        // В окне: свой сервер добавлен, Comss удалён. На диске: защита обновила список.
+        let mut window = Config::default();
+        window.servers.push(server("Мой DNS", &["10.0.0.1"], &[], "", false, ""));
+        window.servers.last_mut().unwrap().builtin = false;
+        window.servers.retain(|s| s.name != "Comss DNS");
+        window.hidden_builtin.push("Comss DNS".into());
+
+        let mut disk = Config::default();
+        let mut list = embedded_list();
+        list.version += 1;
+        list.servers.retain(|s| s.name != "Xbox-DNS");
+        list.servers.iter_mut().find(|s| s.name == "GeoHide EU").unwrap().ipv4 = vec!["5.175.161.3".into()];
+        list.servers.push(server("Свежий", &["10.1.1.1"], &[], "", true, ""));
+        disk.apply_server_list(&list, &[]);
+
+        window.merge_remote_list(&disk);
+        assert!(window.find("Мой DNS").is_some(), "правка окна сохраняется");
+        assert!(window.find("Comss DNS").is_none(), "удалённый в окне не возвращается");
+        assert!(window.find("Xbox-DNS").is_none(), "убранный списком убирается");
+        assert!(window.find("Свежий").is_some(), "добавленный списком появляется");
+        assert_eq!(window.find("GeoHide EU").unwrap().ipv4, ["5.175.161.3"]);
+        assert_eq!(window.remote_list_version, list.version);
     }
 
     #[test]

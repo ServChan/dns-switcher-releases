@@ -99,6 +99,10 @@ fn now_text() -> String {
 
 /// Добавляет строку в журнал. Когда журнал разрастается, старые строки отрезаются.
 pub fn log(text: &str) {
+    // Тесты не пишут в настоящий журнал программы.
+    if cfg!(test) {
+        return;
+    }
     let path = log_path();
     let _ = std::fs::create_dir_all(data_dir());
     let line = format!("{}  {}\n", now_text(), text.replace('\n', " "));

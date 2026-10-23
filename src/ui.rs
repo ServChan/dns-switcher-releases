@@ -39,13 +39,15 @@ enum Done {
 }
 
 enum Msg {
-    Done { done: Done, outcomes: Vec<Outcome> },
+    /// `adapters`: GUID подключений, к которым применяли (выбор мог поменяться за это время).
+    Done { done: Done, outcomes: Vec<Outcome>, adapters: Vec<String> },
     Health { name: String, health: Health },
     Task(Result<bool, String>),
     Browsers(Vec<browsers::BrowserDns>),
     BrowserFixed(String, Result<(), String>),
     E2e(Option<EndToEnd>),
-    AutoPicked(Vec<(DnsServer, Health)>),
+    /// Итог подбора и номер действия, при котором он начался.
+    AutoPicked(Vec<(DnsServer, Health)>, u64),
     UpdateChecked(Result<Option<update::Manifest>, String>),
     UpdateDownloaded(Result<PathBuf, String>),
     ListUpdated(Result<(u32, Vec<String>), String>),
@@ -90,7 +92,7 @@ struct Status {
 }
 
 enum Confirm {
-    Delete(usize),
+    Delete(String),
     RestoreDefaults,
     Reset,
 }
@@ -145,6 +147,17 @@ impl Editor {
     }
 }
 
+/// Одинаковы ли настройки сервера (без служебных отметок).
+fn same_server(a: &DnsServer, b: &DnsServer) -> bool {
+    a.name == b.name
+        && a.ipv4 == b.ipv4
+        && a.ipv6 == b.ipv6
+        && a.doh == b.doh
+        && a.ai_bypass == b.ai_bypass
+        && a.doh_only == b.doh_only
+        && a.note == b.note
+}
+
 enum DialogResult {
     Open,
     Accept,
@@ -178,6 +191,8 @@ pub struct DnsApp {
     updates: update::UpdateState,
     update_busy: Option<String>,
     auto_picking: bool,
+    /// Растёт с каждым «Применить»/«Сбросить»: подбор, начатый до них, не применяется.
+    action_epoch: u64,
     new_probe: (String, String),
     /// Ход и итог исправления браузеров: показывается прямо в их плашке.
     browser_note: HashMap<String, (bool, String)>,
@@ -209,6 +224,9 @@ impl DnsApp {
             std::thread::spawn(move || monitor::run_loop(stop, true));
         }
 
+        if crate::elevate::is_admin() {
+            std::thread::spawn(install::drop_unsafe_tasks);
+        }
         let runtime = RuntimeState::load();
         let mut app = Self {
             config: Config::load(),
@@ -229,6 +247,7 @@ impl DnsApp {
             updates: update::UpdateState::load(),
             update_busy: None,
             auto_picking: false,
+            action_epoch: 0,
             new_probe: Default::default(),
             browser_note: HashMap::new(),
             config_stamp: crate::config::config_stamp(),
@@ -341,7 +360,8 @@ impl DnsApp {
 
     /// Индекс сервера из списка, который сейчас стоит первым DNS на адаптере.
     fn server_in_use(&self, adapter: &Adapter) -> Option<usize> {
-        let first = adapter.dns.first()?;
+        // Основной адрес: первый IPv4, IPv6 Windows может перечислить раньше.
+        let first = adapter.dns.iter().find(|ip| ip.is_ipv4()).or_else(|| adapter.dns.first())?;
         self.config.servers.iter().position(|s| {
             s.all_ips().any(|ip| ip.parse::<IpAddr>().ok().as_ref() == Some(first))
         })
@@ -356,12 +376,14 @@ impl DnsApp {
     }
 
     fn save_config(&mut self) {
-        // Фоновая защита могла записать свежий список серверов: не затираем его.
+        // Фоновая защита могла записать свежий список серверов: переносим его
+        // изменения в наш список, не теряя только что сделанную правку.
         if crate::config::config_stamp() != self.config_stamp {
             let disk = Config::load();
             if disk.remote_list_version > self.config.remote_list_version {
-                self.config.servers = disk.servers;
-                self.config.remote_list_version = disk.remote_list_version;
+                let selected = self.selected_name();
+                self.config.merge_remote_list(&disk);
+                self.reselect(selected);
             }
         }
         if let Err(e) = self.config.save() {
@@ -370,16 +392,43 @@ impl DnsApp {
         self.config_stamp = crate::config::config_stamp();
     }
 
+    fn selected_name(&self) -> Option<String> {
+        self.selected.and_then(|i| self.config.servers.get(i)).map(|s| s.name.clone())
+    }
+
+    fn reselect(&mut self, name: Option<String>) {
+        self.selected = name.and_then(|n| self.config.servers.iter().position(|s| s.name == n));
+    }
+
     /// Настройки изменил другой процесс: перечитываем, сохраняя выбранный сервер.
     fn reload_config_if_changed(&mut self) {
         let stamp = crate::config::config_stamp();
-        if stamp == self.config_stamp || self.editor.is_some() {
+        if stamp == self.config_stamp || self.editor.is_some() || self.confirm.is_some() {
             return;
         }
-        let selected = self.selected.and_then(|i| self.config.servers.get(i)).map(|s| s.name.clone());
+        self.reload_config();
+    }
+
+    fn reload_config(&mut self) {
+        let selected = self.selected_name();
         self.config = Config::load();
-        self.config_stamp = stamp;
-        self.selected = selected.and_then(|n| self.config.servers.iter().position(|s| s.name == n));
+        self.config_stamp = crate::config::config_stamp();
+        self.reselect(selected);
+    }
+
+    /// Спрашивает про удаление. Сервер, который сейчас стоит или выбран для защиты,
+    /// удалить нельзя: подключение осталось бы на адресах, которых нет в списке.
+    fn ask_delete(&mut self, index: usize) {
+        let Some(name) = self.config.servers.get(index).map(|s| s.name.clone()) else { return };
+        let st = RuntimeState::load();
+        if st.preferred.as_deref() == Some(&name) || st.active.as_deref() == Some(&name) {
+            self.set_status(
+                StatusKind::Warning,
+                format!("«{name}» сейчас используется. Чтобы удалить его, сначала примените другой сервер или сбросьте DNS."),
+            );
+            return;
+        }
+        self.confirm = Some(Confirm::Delete(name));
     }
 
     fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
@@ -425,7 +474,10 @@ impl DnsApp {
     }
 
     fn start_action(&mut self, ctx: &egui::Context, action: Action, done: Done) {
+        self.action_epoch += 1;
+        self.e2e = None;
         let adapters = self.chosen_adapters();
+        let guids: Vec<String> = adapters.iter().map(|a| a.guid.clone()).collect();
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         self.busy = Some(match &done {
@@ -435,7 +487,7 @@ impl DnsApp {
         self.status = None;
         std::thread::spawn(move || {
             let outcomes = apply::run(&action, &adapters);
-            let _ = tx.send(Msg::Done { done, outcomes });
+            let _ = tx.send(Msg::Done { done, outcomes, adapters: guids });
             ctx.request_repaint();
         });
     }
@@ -506,7 +558,7 @@ impl DnsApp {
                         self.set_status(StatusKind::Error, e);
                     }
                 },
-                Msg::AutoPicked(checked) => self.finish_auto_pick(checked),
+                Msg::AutoPicked(checked, epoch) => self.finish_auto_pick(checked, epoch),
                 Msg::UpdateChecked(result) => {
                     self.update_busy = None;
                     let mut us = update::UpdateState::load();
@@ -535,7 +587,13 @@ impl DnsApp {
                     self.update_busy = None;
                     match result {
                         Ok((version, changes)) => {
-                            self.config = Config::load();
+                            // Пока открыт редактор или вопрос, их номера строк должны
+                            // остаться верными: перечитаем после закрытия.
+                            if self.editor.is_some() || self.confirm.is_some() {
+                                self.config_stamp = None;
+                            } else {
+                                self.reload_config();
+                            }
                             let text = if changes.is_empty() {
                                 format!("Список серверов актуален (версия {version}).")
                             } else {
@@ -565,9 +623,9 @@ impl DnsApp {
                     }
                     Err(e) => self.set_status(StatusKind::Error, format!("Не удалось изменить IPv6 на {name}: {e}")),
                 },
-                Msg::Done { done, outcomes } => {
+                Msg::Done { done, outcomes, adapters } => {
                     self.busy = None;
-                    self.finish_action(done, outcomes);
+                    self.finish_action(done, outcomes, adapters);
                     self.refresh_adapters();
                 }
                 Msg::Task(result) => {
@@ -592,7 +650,7 @@ impl DnsApp {
         }
     }
 
-    fn finish_action(&mut self, done: Done, outcomes: Vec<Outcome>) {
+    fn finish_action(&mut self, done: Done, outcomes: Vec<Outcome>, adapters: Vec<String>) {
         let names: Vec<&str> = outcomes.iter().map(|o| o.adapter.as_str()).collect();
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
@@ -610,7 +668,7 @@ impl DnsApp {
                 Done::Applied(name) => {
                     st.preferred = Some(name.clone());
                     st.active = Some(name.clone());
-                    st.adapters = self.chosen.iter().cloned().collect();
+                    st.adapters = adapters;
                     state::log(&format!("Вручную применён «{name}» для: {}.", names.join(", ")));
                 }
                 Done::Reset => {
@@ -912,7 +970,7 @@ impl DnsApp {
         match action {
             Some(RowAction::Apply(i)) => self.apply_server(&ctx, i),
             Some(RowAction::Edit(i)) => self.editor = Some(Editor::from_server(i, &self.config.servers[i])),
-            Some(RowAction::Delete(i)) => self.confirm = Some(Confirm::Delete(i)),
+            Some(RowAction::Delete(i)) => self.ask_delete(i),
             Some(RowAction::Move(i, down)) => self.move_server(i, down),
             None => {}
         }
@@ -1163,7 +1221,7 @@ impl DnsApp {
             match action {
                 Some(RowAction::Apply(i)) => self.apply_server(&ctx, i),
                 Some(RowAction::Edit(i)) => self.editor = Some(Editor::from_server(i, &self.config.servers[i])),
-                Some(RowAction::Delete(i)) => self.confirm = Some(Confirm::Delete(i)),
+                Some(RowAction::Delete(i)) => self.ask_delete(i),
                 Some(RowAction::Move(i, down)) => self.move_server(i, down),
                 None => {}
             }
@@ -1324,10 +1382,21 @@ impl DnsApp {
                         self.editor = Some(ed);
                     }
                     Ok(()) => {
+                        let mut server = server;
                         let index = match ed.index {
                             Some(i) => {
+                                // Сохранили без изменений: стандартный сервер остаётся
+                                // нетронутым и дальше получает адреса из списка.
+                                if same_server(&self.config.servers[i], &server) {
+                                    server.edited = self.config.servers[i].edited;
+                                }
                                 let old = std::mem::replace(&mut self.config.servers[i], server.clone());
                                 if old.name != server.name {
+                                    // Иначе обновление списка вернуло бы стандартный сервер
+                                    // под старым именем рядом с переименованным.
+                                    if old.builtin && !self.config.hidden_builtin.contains(&old.name) {
+                                        self.config.hidden_builtin.push(old.name.clone());
+                                    }
                                     self.rename_in_state(&old.name, &server.name);
                                 }
                                 i
@@ -1373,9 +1442,9 @@ impl DnsApp {
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
         let Some(confirm) = self.confirm.take() else { return };
         let (title, text, accept) = match &confirm {
-            Confirm::Delete(i) => (
+            Confirm::Delete(name) => (
                 "Удалить сервер?".to_string(),
-                format!("«{}» пропадёт из списка. Настройки подключений не изменятся.", self.config.servers[*i].name),
+                format!("«{name}» пропадёт из списка. Настройки подключений не изменятся."),
                 "Удалить",
             ),
             Confirm::RestoreDefaults => (
@@ -1422,23 +1491,44 @@ impl DnsApp {
             DialogResult::Open => self.confirm = Some(confirm),
             DialogResult::Cancel => {}
             DialogResult::Accept => match confirm {
-                Confirm::Delete(i) => {
+                Confirm::Delete(name) => {
+                    // Пока был открыт вопрос, защита могла переключиться на этот сервер.
+                    let st = RuntimeState::load();
+                    if st.preferred.as_deref() == Some(&name) || st.active.as_deref() == Some(&name) {
+                        self.set_status(
+                            StatusKind::Warning,
+                            format!("«{name}» сейчас используется. Чтобы удалить его, сначала примените другой сервер или сбросьте DNS."),
+                        );
+                        return;
+                    }
+                    let Some(i) = self.config.servers.iter().position(|s| s.name == name) else { return };
+                    let selected = self.selected_name();
                     let removed = self.config.servers.remove(i);
                     if removed.builtin && !self.config.hidden_builtin.contains(&removed.name) {
                         self.config.hidden_builtin.push(removed.name.clone());
                     }
-                    let name = removed.name;
-                    self.selected = match self.selected {
-                        Some(s) if s == i => None,
-                        Some(s) if s > i => Some(s - 1),
-                        other => other,
-                    };
+                    self.reselect(selected);
                     self.health.remove(&name);
                     self.save_config();
                     self.set_status(StatusKind::Success, format!("«{name}» удалён из списка."));
                 }
                 Confirm::RestoreDefaults => {
+                    // Используемый сервер остаётся, иначе защита потеряет его из виду.
+                    let st = RuntimeState::load();
+                    let keep: Vec<DnsServer> = self
+                        .config
+                        .servers
+                        .iter()
+                        .filter(|s| [&st.preferred, &st.active].iter().any(|n| n.as_deref() == Some(s.name.as_str())))
+                        .filter(|s| !default_servers().iter().any(|d| d.name == s.name))
+                        .cloned()
+                        .collect();
                     self.config.servers = default_servers();
+                    self.config.servers.extend(keep);
+                    self.config.hidden_builtin.clear();
+                    // Стандартный набор встроен в программу: свежий подписанный список
+                    // применится заново при следующей проверке.
+                    self.config.remote_list_version = 0;
                     self.selected = None;
                     self.save_config();
                     self.start_sweep(ctx);
@@ -1494,9 +1584,10 @@ impl DnsApp {
 impl DnsApp {
     /// «Подобрать лучший сервер»: проверить все серверы для ИИ и включить лучший.
     fn start_auto_pick(&mut self, ctx: &egui::Context) {
-        if self.auto_picking || self.blocker().is_some() {
+        if self.auto_picking || self.busy.is_some() || self.blocker().is_some() {
             return;
         }
+        let epoch = self.action_epoch;
         self.auto_picking = true;
         self.status = None;
         let cfg = self.config.clone();
@@ -1508,15 +1599,27 @@ impl DnsApp {
         std::thread::spawn(move || {
             let ai: Vec<DnsServer> = cfg.servers.iter().filter(|s| s.ai_bypass).cloned().collect();
             let checked = monitor::check_all(&cfg, &ai);
-            let _ = tx.send(Msg::AutoPicked(checked));
+            let _ = tx.send(Msg::AutoPicked(checked, epoch));
             ctx.request_repaint();
         });
     }
 
-    fn finish_auto_pick(&mut self, checked: Vec<(DnsServer, Health)>) {
+    fn finish_auto_pick(&mut self, checked: Vec<(DnsServer, Health)>, epoch: u64) {
         self.auto_picking = false;
         for (s, h) in &checked {
             self.health.insert(s.name.clone(), HealthView::Done(h.clone()));
+        }
+        if epoch != self.action_epoch || self.busy.is_some() {
+            // Пока шёл подбор, DNS уже поменяли вручную: выбор пользователя важнее.
+            self.set_status(StatusKind::Warning, "Подбор не применён: пока он шёл, DNS изменили вручную.");
+            return;
+        }
+        if checked.is_empty() {
+            self.set_status(
+                StatusKind::Error,
+                "В списке нет серверов для ИИ. Добавьте сервер и отметьте «Для обхода региональных ограничений ИИ».",
+            );
+            return;
         }
         let snapshot = state::Snapshot::load();
         let rank = |name: &str| snapshot.reliability(name).map(|r| 100 - r).unwrap_or(50);
@@ -1600,14 +1703,8 @@ impl DnsApp {
         }
         self.update_busy = Some("Обновляю список серверов…".into());
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
-        let keep: Vec<String> = [self.runtime.preferred.clone(), self.runtime.active.clone()].into_iter().flatten().collect();
         std::thread::spawn(move || {
-            let result = update::fetch_server_list().map(|list| {
-                let mut cfg = Config::load();
-                let changes = cfg.apply_server_list(&list, &keep);
-                let _ = cfg.save();
-                (list.version, changes)
-            });
+            let result = update::fetch_server_list().map(|list| (list.version, monitor::apply_list(&list)));
             let _ = tx.send(Msg::ListUpdated(result));
             ctx.request_repaint();
         });
@@ -1745,6 +1842,11 @@ impl DnsApp {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        // После обновления окно открывает установщик, и Windows может оставить его
+        // позади других окон: на первых кадрах просим вывести его вперёд.
+        if ctx.cumulative_pass_nr() <= 1 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.poll_messages();
         self.periodic(&ctx);
         let bg = palette(ui).bg;

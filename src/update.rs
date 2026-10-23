@@ -112,7 +112,16 @@ pub fn download_app(m: &Manifest) -> Result<PathBuf, String> {
         return Err("файл скачался не полностью или изменён: хеш не совпал".into());
     }
     verify(&data, &m.signature)?;
-    let path = std::env::temp_dir().join(format!("DnsSwitcher-Setup-{}.exe", m.version));
+    // Проверенный файл кладём в папку установки, куда пишет только администратор:
+    // во временной папке его успели бы подменить до запуска с правами администратора.
+    let dir = crate::install::installed_dir()
+        .filter(|d| crate::install::is_protected_dir(d))
+        .map(|d| d.join(crate::install::UPDATES_DIR))
+        .ok_or("обновлять из программы можно только копию, установленную в Program Files; скачайте новую версию со страницы выпусков")?;
+    // Прежние скачанные установщики больше не нужны.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("не удалось создать {}: {e}", dir.display()))?;
+    let path = dir.join(format!("DnsSwitcher-Setup-{}.exe", m.version));
     std::fs::write(&path, &data).map_err(|e| format!("не удалось сохранить установщик: {e}"))?;
     Ok(path)
 }

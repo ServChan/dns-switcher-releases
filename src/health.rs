@@ -72,6 +72,8 @@ pub struct ServiceHealth {
     pub ipv6_leak: bool,
     /// Ошибка, если DNS не дал адресов для этого сервиса.
     pub dns_error: Option<String>,
+    /// Все адреса, которые сервер выдал для сервиса (проверяются не все).
+    pub addresses: Vec<Ipv4Addr>,
     pub proxies: Vec<(Ipv4Addr, Result<u32, String>)>,
 }
 
@@ -276,7 +278,15 @@ fn check_service(
     template: &str,
     depth: Depth,
 ) -> ServiceHealth {
-    let mut out = ServiceHealth { name, domain: domain.clone(), proxied: None, ipv6_leak: false, dns_error: None, proxies: Vec::new() };
+    let mut out = ServiceHealth {
+        name,
+        domain: domain.clone(),
+        proxied: None,
+        ipv6_leak: false,
+        dns_error: None,
+        addresses: Vec::new(),
+        proxies: Vec::new(),
+    };
     // Запрос по DoH сам идёт по TLS и иногда портится в сети: повторяем и пробуем
     // другие адреса сервера, прежде чем считать, что адреса сервиса нет.
     let mut answer = Err("нет ответа".to_string());
@@ -299,6 +309,7 @@ fn check_service(
             return out;
         }
     };
+    out.addresses = addrs.clone();
     // Подменяет ли сервер адрес: ответ, совпадающий с эталонным, значит обхода нет.
     if let Some(real) = reference(&domain, QTYPE_A) {
         let real: Vec<Ipv4Addr> = real.iter().filter_map(|ip| match ip {
@@ -360,24 +371,26 @@ pub fn tls_error_text(e: &std::io::Error) -> String {
     }
 }
 
-/// Ответ эталонного DNS (Cloudflare, затем Google) по DoH. Кэшируется на 10 минут.
+/// Ответ эталонного DNS (Cloudflare, затем Google) по DoH. Ответ кэшируется на
+/// 10 минут, неудача на минуту: если эталон недоступен, каждая проверка иначе
+/// ждала бы его таймаутов заново.
 fn reference(domain: &str, qtype: u16) -> Option<Vec<IpAddr>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, u16), (Instant, Vec<IpAddr>)>>> = OnceLock::new();
+    type Cache = HashMap<(String, u16), (Instant, Option<Vec<IpAddr>>)>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (domain.to_string(), qtype);
     if let Some((at, ips)) = cache.lock().ok()?.get(&key) {
-        if at.elapsed() < Duration::from_secs(600) {
-            return Some(ips.clone());
+        let ttl = if ips.is_some() { 600 } else { 60 };
+        if at.elapsed() < Duration::from_secs(ttl) {
+            return ips.clone();
         }
     }
-    for (ip, template) in REFERENCE {
-        let Ok(addr) = ip.parse::<IpAddr>() else { continue };
-        if let Ok(ips) = retry_once(|| resolve_any(addr, Method::Doh, template, domain, qtype)) {
-            cache.lock().ok()?.insert(key, (Instant::now(), ips.clone()));
-            return Some(ips);
-        }
-    }
-    None
+    let found = REFERENCE.iter().find_map(|(ip, template)| {
+        let addr = ip.parse::<IpAddr>().ok()?;
+        retry_once(|| resolve_any(addr, Method::Doh, template, domain, qtype)).ok()
+    });
+    cache.lock().ok()?.insert(key, (Instant::now(), found.clone()));
+    found
 }
 
 /// Как отвечает сама Windows: системный резолвер в обход кэша.
@@ -428,20 +441,35 @@ impl EndToEnd {
 }
 
 /// Сверяет ответ Windows для первого проверяемого сервиса с ответом сервера.
+/// Серверы с пулом прокси на каждый запрос отдают разные адреса, поэтому «не от
+/// сервера» выносится, только когда Windows получает настоящие адреса сервиса.
 pub fn end_to_end(server: &DnsServer, health: &Health) -> Option<EndToEnd> {
     let service = health.services.iter().find(|s| s.dns_error.is_none())?;
-    let mut server_ips: Vec<Ipv4Addr> = health.services.iter().flat_map(|s| s.proxies.iter().map(|(a, _)| *a)).collect();
+    let mut server_ips: Vec<Ipv4Addr> = health
+        .services
+        .iter()
+        .flat_map(|s| s.addresses.iter().copied().chain(s.proxies.iter().map(|(a, _)| *a)))
+        .collect();
     server_ips.extend(server.ipv4.iter().filter_map(|s| s.parse::<Ipv4Addr>().ok()));
     let system = system_resolve(&service.domain);
     let (via_server, real) = match &system {
         Ok(ips) if !ips.is_empty() => {
-            let via = ips.iter().any(|a| server_ips.contains(a));
+            let matched = ips.iter().any(|a| server_ips.contains(a));
             let real = reference(&service.domain, QTYPE_A).map(|r| ips.iter().any(|a| r.contains(&IpAddr::V4(*a))));
-            (Some(via), real)
+            (e2e_verdict(matched, real), real)
         }
         _ => (None, None),
     };
     Some(EndToEnd { domain: service.domain.clone(), system, via_server, real })
+}
+
+/// `matched`: Windows отдала адрес из ответа сервера; `real`: адрес настоящий.
+fn e2e_verdict(matched: bool, real: Option<bool>) -> Option<bool> {
+    if matched {
+        return Some(true);
+    }
+    // Не совпал, но и не настоящий: это прокси того же пула. Настоящий: обхода нет.
+    real.map(|r| !r)
 }
 
 /// Полное TLS-рукопожатие с прокси под именем сервиса. Сертификат проверяется:
@@ -659,6 +687,14 @@ mod tests {
         assert_eq!(parse_answers(&m).0, vec![Ipv4Addr::new(1, 2, 3, 4)]);
     }
 
+    #[test]
+    fn e2e_blames_server_only_for_real_addresses() {
+        assert_eq!(e2e_verdict(true, Some(true)), Some(true));
+        assert_eq!(e2e_verdict(false, Some(false)), Some(true));
+        assert_eq!(e2e_verdict(false, Some(true)), Some(false));
+        assert_eq!(e2e_verdict(false, None), None);
+    }
+
     fn svc(results: &[Result<u32, String>]) -> ServiceHealth {
         ServiceHealth {
             name: "ChatGPT".into(),
@@ -666,6 +702,7 @@ mod tests {
             proxied: Some(true),
             ipv6_leak: false,
             dns_error: None,
+            addresses: vec![Ipv4Addr::LOCALHOST],
             proxies: results.iter().map(|r| (Ipv4Addr::LOCALHOST, r.clone())).collect(),
         }
     }

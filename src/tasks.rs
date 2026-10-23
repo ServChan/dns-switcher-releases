@@ -28,6 +28,14 @@ pub fn remove(name: &str) -> Result<(), String> {
 /// Создаёт (или пересоздаёт) задание с наивысшими правами для текущего пользователя.
 /// `at_logon` добавляет запуск при входе в Windows, иначе задание запускается по требованию.
 pub fn create(name: &str, exe: &Path, args: &str, at_logon: bool, description: &str) -> Result<(), String> {
+    // Задание запускает exe с правами администратора без вопросов, поэтому exe должен
+    // лежать там, где его не подменить без этих прав, то есть в Program Files.
+    let Some(dir) = exe.parent().filter(|d| crate::install::is_protected_dir(d)) else {
+        return Err(format!(
+            "Задание «{name}» можно создать только для программы, установленной в Program Files: иначе любую программу можно было бы подложить на место {} и запустить с правами администратора.",
+            exe.display()
+        ));
+    };
     let user = format!(
         "{}\\{}",
         std::env::var("USERDOMAIN").unwrap_or_default(),
@@ -82,12 +90,16 @@ pub fn create(name: &str, exe: &Path, args: &str, at_logon: bool, description: &
     );
 
     // schtasks принимает XML в UTF-16 с BOM.
-    let path = std::env::temp_dir().join(format!("dns-switcher-{}.xml", std::process::id()));
+    // Файл задания кладём рядом с программой, куда пишет только администратор:
+    // во временной папке его можно подменить до того, как schtasks его прочтёт.
+    let path = dir.join(format!("dns-switcher-task-{}.xml", crate::sys::random_suffix()));
     let mut bytes = vec![0xFF, 0xFE];
     for unit in xml.encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut file, &bytes).map_err(|e| e.to_string())?;
+    drop(file);
     let path_text = path.to_string_lossy().to_string();
     let created = apply::run_tool("schtasks", &["/Create", "/TN", name, "/XML", &path_text, "/F"]);
     let _ = std::fs::remove_file(&path);

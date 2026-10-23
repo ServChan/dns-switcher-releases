@@ -19,6 +19,8 @@ const EXE_NAME: &str = "dns-switcher.exe";
 const UNINSTALL_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\DnsSwitcher";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
+/// Папка для скачанных обновлений внутри папки установки: туда может писать только администратор.
+pub const UPDATES_DIR: &str = "updates";
 
 #[derive(Clone)]
 pub struct InstallOptions {
@@ -128,11 +130,34 @@ pub fn running_installed() -> bool {
 /// Папка внутри Program Files: менять там файлы может только администратор.
 /// Это важно, потому что задания запускают программу с наивысшими правами.
 pub fn is_protected_dir(dir: &Path) -> bool {
-    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"].iter().any(|var| {
-        std::env::var_os(var).is_some_and(|base| {
-            dir.to_string_lossy().to_lowercase().starts_with(&base.to_string_lossy().to_lowercase())
-        })
-    })
+    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some_and(|base| crate::sys::is_inside(dir, Path::new(&base))))
+}
+
+/// Копия, установленная прежними версиями вне Program Files: её задания запускали бы
+/// с правами администратора файл, который может подменить любая программа.
+/// Убирает такие задания и пишет в журнал, что делать.
+pub fn drop_unsafe_tasks() {
+    let Some(dir) = installed_dir() else { return };
+    if is_protected_dir(&dir) {
+        return;
+    }
+    let mut removed = Vec::new();
+    for name in [tasks::LAUNCHER, tasks::WATCHDOG] {
+        if tasks::exists(name) && tasks::remove(name).is_ok() {
+            removed.push(name);
+        }
+    }
+    if !removed.is_empty() {
+        state::log(&format!(
+            "Программа установлена вне Program Files ({}), поэтому задания {} убраны: через них можно было \
+             подменить программу и получить права администратора. Чтобы вернуть фоновую защиту и запуск \
+             без UAC, переустановите программу в Program Files.",
+            dir.display(),
+            removed.join(" и ")
+        ));
+    }
 }
 
 /// Программа сейчас управляет DNS подключений (было «Применить»).
@@ -239,16 +264,21 @@ pub fn run_uninstall_step(step: Step, dir: Option<&Path>) -> Result<(), String> 
         },
         Step::RemoveFiles => {
             // Папку запоминает мастер до начала: запись в реестре к этому шагу уже удалена.
+            // Удаляются только свои файлы: папку могли выбрать общую (например, D:\Tools),
+            // и чужое в ней должно остаться. Сама папка удаляется, только если опустела.
             let Some(dir) = dir else { return Ok(()) };
+            let _ = std::fs::remove_dir_all(dir.join(UPDATES_DIR));
             if running_from(dir) {
                 schedule_dir_removal(dir);
-                Ok(())
-            } else {
-                match std::fs::remove_dir_all(dir) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                        Err(format!("Не удалось удалить {}: {e}", dir.display()))
-                    }
-                    _ => Ok(()),
+                return Ok(());
+            }
+            match std::fs::remove_file(dir.join(EXE_NAME)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(format!("Не удалось удалить {}: {e}", dir.join(EXE_NAME).display()))
+                }
+                _ => {
+                    let _ = std::fs::remove_dir(dir);
+                    Ok(())
                 }
             }
         }
@@ -263,15 +293,17 @@ fn running_from(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Свой exe удалить нельзя, пока он работает: cmd удалит папку после выхода,
-/// повторяя попытки до двух минут.
+/// Свой exe удалить нельзя, пока он работает: cmd удалит его после выхода,
+/// повторяя попытки до двух минут, а затем папку, если в ней больше ничего нет.
 fn schedule_dir_removal(dir: &Path) {
     let d = dir.display();
+    let exe = dir.join(EXE_NAME);
+    let e = exe.display();
     let cmd = format!(
-        "for /L %i in (1,1,120) do @(if exist \"{d}\" (rmdir /s /q \"{d}\" 2>nul & ping -n 2 127.0.0.1 >nul))"
+        "/C \"for /L %i in (1,1,120) do @(if exist \"{e}\" (del /f /q \"{e}\" 2>nul & ping -n 2 127.0.0.1 >nul)) & rmdir \"{d}\" 2>nul\""
     );
-    let _ = Command::new("cmd")
-        .args(["/C", &cmd])
+    let _ = Command::new(crate::sys::tool("cmd"))
+        .raw_arg(cmd)
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn();
 }
@@ -279,8 +311,7 @@ fn schedule_dir_removal(dir: &Path) {
 /// Останавливает фоновое задание и другие копии программы, чтобы exe можно было заменить.
 fn stop_other_instances() {
     let _ = apply::run_tool("schtasks", &["/End", "/TN", tasks::WATCHDOG]);
-    let pid_filter = format!("PID ne {}", std::process::id());
-    let _ = apply::run_tool("taskkill", &["/F", "/IM", EXE_NAME, "/FI", &pid_filter]);
+    crate::sys::terminate_others(EXE_NAME);
     std::thread::sleep(std::time::Duration::from_millis(700));
 }
 
@@ -363,6 +394,8 @@ pub fn silent_update() -> Result<(), String> {
 
 /// Запускает установленную программу отдельно от установщика.
 pub fn launch(dir: &Path) -> Result<(), String> {
+    // Разрешаем новому окну выйти на передний план: иначе Windows откроет его позади.
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(u32::MAX) };
     Command::new(dir.join(EXE_NAME))
         .creation_flags(DETACHED_PROCESS)
         .spawn()

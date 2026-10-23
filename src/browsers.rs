@@ -2,15 +2,6 @@
 //! смена DNS в программе на него не действует: обход ограничений там не работает.
 
 use std::path::{Path, PathBuf};
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, TerminateProcess,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE};
 use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
@@ -284,90 +275,27 @@ fn firefox_pref(text: &str, name: &str) -> Option<String> {
 
 // ---------- Процессы браузера ----------
 
-struct Proc {
-    pid: u32,
-    name: String,
-    path: String,
-}
+use crate::sys::{self, Proc, processes};
 
-fn processes() -> Vec<Proc> {
-    let mut out = Vec::new();
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap.is_null() || snap as isize == -1 {
-            return out;
-        }
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut ok = Process32FirstW(snap, &mut entry) != 0;
-        while ok {
-            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
-            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-            out.push(Proc { pid: entry.th32ProcessID, path: process_path(entry.th32ProcessID), name });
-            ok = Process32NextW(snap, &mut entry) != 0;
-        }
-        CloseHandle(snap);
-    }
-    out
-}
-
-fn process_path(pid: u32) -> String {
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h.is_null() {
-            return String::new();
-        }
-        let mut buf = [0u16; 1024];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
-        CloseHandle(h);
-        if ok { String::from_utf16_lossy(&buf[..len as usize]) } else { String::new() }
-    }
-}
-
-/// Процессы именно этого браузера: имя exe и, где нужно, часть пути.
+/// Процессы именно этого браузера в своём сеансе: имя exe и, где нужно, часть пути.
+/// Tor Browser тоже называется firefox.exe, его программа не трогает.
 fn browser_pids(b: &BrowserDns, procs: &[Proc]) -> Vec<u32> {
     procs
         .iter()
         .filter(|p| p.name.eq_ignore_ascii_case(b.exe))
-        .filter(|p| b.path_hint.is_empty() || p.path.to_lowercase().contains(b.path_hint))
+        .filter(|p| {
+            let path = p.path.to_lowercase();
+            (b.path_hint.is_empty() || path.contains(b.path_hint)) && !path.contains(r"\tor browser\")
+        })
         .map(|p| p.pid)
         .collect()
 }
 
-/// Просит видимые окна процессов закрыться, как при нажатии на крестик.
-fn close_windows(pids: &[u32]) {
-    struct Ctx<'a> {
-        pids: &'a [u32],
-    }
-    unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> i32 {
-        let ctx = unsafe { &*(lparam as *const Ctx) };
-        let mut pid = 0u32;
-        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
-        if ctx.pids.contains(&pid) && unsafe { IsWindowVisible(hwnd) } != 0 {
-            unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
-        }
-        1
-    }
-    let ctx = Ctx { pids };
-    unsafe { EnumWindows(Some(each), &ctx as *const Ctx as LPARAM) };
-}
-
-fn terminate(pids: &[u32]) {
-    for &pid in pids {
-        unsafe {
-            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if !h.is_null() {
-                TerminateProcess(h, 1);
-                CloseHandle(h);
-            }
-        }
-    }
-}
-
-/// Закрывает браузер, исправляет его DNS и открывает снова. Закрытие штатное:
-/// браузер сохраняет вкладки. Если он не закрылся за 10 секунд (например, работает
-/// в фоне), его процессы завершаются принудительно.
+/// Закрывает браузер, исправляет его DNS и открывает снова. С одним окном закрытие
+/// штатное, как крестиком. Если окон несколько, закрывать их по одному нельзя:
+/// браузер запомнил бы только последнее. Тогда процессы завершаются сразу, и браузер
+/// при следующем запуске восстановит все окна и вкладки. Если штатно браузер не
+/// закрылся за 10 секунд (например, работает в фоне), он тоже завершается.
 pub fn close_fix_reopen(b: &BrowserDns) -> Result<(), String> {
     let procs = processes();
     let pids = browser_pids(b, &procs);
@@ -377,16 +305,19 @@ pub fn close_fix_reopen(b: &BrowserDns) -> Result<(), String> {
         .map(|p| PathBuf::from(&p.path));
     let was_running = !pids.is_empty();
     if was_running {
-        close_windows(&pids);
-        for _ in 0..20 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if browser_pids(b, &processes()).is_empty() {
-                break;
+        let windows = sys::visible_windows(&pids);
+        if windows.len() == 1 {
+            sys::close_windows(&windows);
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if browser_pids(b, &processes()).is_empty() {
+                    break;
+                }
             }
         }
         let left = browser_pids(b, &processes());
         if !left.is_empty() {
-            terminate(&left);
+            sys::terminate(&left);
             std::thread::sleep(std::time::Duration::from_millis(1500));
         }
         if !browser_pids(b, &processes()).is_empty() {
@@ -400,7 +331,7 @@ pub fn close_fix_reopen(b: &BrowserDns) -> Result<(), String> {
     fix(&fresh)?;
     if let (true, Some(path)) = (was_running, exe_path) {
         // Открываем от имени пользователя через Проводник, а не с правами администратора.
-        let _ = std::process::Command::new("explorer").arg(path).spawn();
+        sys::open_in_explorer(path);
     }
     Ok(())
 }
@@ -422,7 +353,7 @@ pub fn fix(b: &BrowserDns) -> Result<(), String> {
             json["dns_over_https"]["mode"] = serde_json::Value::String("automatic".into());
             json["dns_over_https"]["templates"] = serde_json::Value::String(String::new());
             let text = serde_json::to_string(&json).map_err(|e| e.to_string())?;
-            std::fs::write(local_state, text).map_err(|e| format!("Не удалось сохранить настройки {}: {e}", b.name))
+            write_replace(local_state, text.as_bytes()).map_err(|e| format!("Не удалось сохранить настройки {}: {e}", b.name))
         }
         Kind::Firefox { prefs } => {
             for file in prefs {
@@ -441,11 +372,23 @@ pub fn fix(b: &BrowserDns) -> Result<(), String> {
                         }
                     })
                     .collect();
-                std::fs::write(file, fixed.join("\n") + "\n").map_err(|e| e.to_string())?;
+                write_replace(file, (fixed.join("\n") + "\n").as_bytes()).map_err(|e| e.to_string())?;
             }
             Ok(())
         }
     }
+}
+
+/// Записывает файл целиком через временный рядом: при сбое на середине старый
+/// файл настроек браузера остаётся нетронутым.
+fn write_replace(file: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut name = file.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".dnsswitcher-{}.tmp", sys::random_suffix()));
+    let tmp = file.with_file_name(name);
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, file).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 fn backup(file: &Path) -> Result<(), String> {
@@ -521,6 +464,26 @@ mod tests {
         assert_eq!(browser_pids(&by("Chromium"), &procs), [2]);
         assert_eq!(browser_pids(&by("Opera GX"), &procs), [3]);
         assert!(browser_pids(&by("Opera"), &procs).is_empty());
+    }
+
+    #[test]
+    fn tor_browser_is_not_firefox() {
+        let procs = vec![
+            Proc { pid: 1, name: "firefox.exe".into(), path: r"C:\Program Files\Mozilla Firefox\firefox.exe".into() },
+            Proc { pid: 2, name: "firefox.exe".into(), path: r"C:\Users\u\Desktop\Tor Browser\Browser\firefox.exe".into() },
+        ];
+        let ff = BrowserDns {
+            name: "Firefox",
+            mode: DnsMode::Own,
+            template: String::new(),
+            by_policy: false,
+            running: false,
+            settings_url: "",
+            exe: "firefox.exe",
+            path_hint: "",
+            kind: Kind::Firefox { prefs: vec![] },
+        };
+        assert_eq!(browser_pids(&ff, &procs), [1]);
     }
 
     #[test]

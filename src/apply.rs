@@ -47,9 +47,11 @@ pub struct Outcome {
 }
 
 pub fn run(action: &Action, adapters: &[Adapter]) -> Vec<Outcome> {
-    // Окно и защита от сбоев могут менять DNS одновременно; выполняем по очереди.
+    // Окно и защита от сбоев могут менять DNS одновременно, в том числе из разных
+    // процессов (фоновое задание): выполняем по очереди под общим мьютексом.
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cross = ApplyLock::take();
     let mut outcomes: Vec<Outcome> = adapters
         .iter()
         .map(|a| Outcome {
@@ -116,7 +118,10 @@ fn apply(adapter: &Adapter, server: &DnsServer, use_doh: bool, safety_net: bool)
     let v6: Vec<String> = chain.iter().flat_map(|s| s.ipv6.iter().cloned()).collect();
     set_family(adapter.index, "ipv4", &v4)?;
     if adapter.ipv6_index != 0 {
-        set_family(adapter.ipv6_index, "ipv6", &v6)?;
+        // IPv4 уже стоит, поэтому сбой здесь только предупреждение.
+        if let Err(e) = set_family(adapter.ipv6_index, "ipv6", &v6) {
+            warnings.push(format!("IPv6-адреса DNS не изменены: {e}"));
+        }
     }
     Ok(warnings)
 }
@@ -211,6 +216,37 @@ fn clear_doh_flags(guid: &str) {
     }
 }
 
+/// Мьютекс на время смены DNS, общий для окна и фонового задания.
+struct ApplyLock(windows_sys::Win32::Foundation::HANDLE);
+
+impl ApplyLock {
+    fn take() -> Option<Self> {
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        let name: Vec<u16> = "Local\\DnsSwitcherApply".encode_utf16().chain(std::iter::once(0)).collect();
+        let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if h.is_null() {
+            return None;
+        }
+        // WAIT_ABANDONED (процесс-владелец завершился) тоже отдаёт мьютекс нам.
+        let r = unsafe { WaitForSingleObject(h, 60_000) };
+        if r == 0 || r == 0x80 {
+            Some(ApplyLock(h))
+        } else {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+            None
+        }
+    }
+}
+
+impl Drop for ApplyLock {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 fn netsh(args: &[&str]) -> Result<(), String> {
     run_tool("netsh", args)
 }
@@ -221,7 +257,7 @@ fn netsh_owned(args: &[String]) -> Result<(), String> {
 }
 
 pub fn run_tool(program: &str, args: &[&str]) -> Result<(), String> {
-    let out = Command::new(program)
+    let out = Command::new(crate::sys::tool(program))
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()

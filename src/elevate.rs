@@ -84,13 +84,14 @@ pub fn single_instance(wait: bool) -> Option<GuiLock> {
     let attempts = if wait { 25 } else { 1 };
     for attempt in 0..attempts {
         let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-        if h.is_null() {
-            return None;
+        // Пустой дескриптор: мьютекс создала копия с правами администратора, и обычному
+        // процессу доступ к нему закрыт. Это тоже значит, что окно уже открыто.
+        if !h.is_null() {
+            if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+                return Some(GuiLock(h));
+            }
+            unsafe { CloseHandle(h) };
         }
-        if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
-            return Some(GuiLock(h));
-        }
-        unsafe { CloseHandle(h) };
         if attempt + 1 < attempts {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }

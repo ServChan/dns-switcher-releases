@@ -11,6 +11,7 @@ mod installer;
 mod monitor;
 mod net;
 mod state;
+mod sys;
 mod tasks;
 mod theme;
 mod tray;

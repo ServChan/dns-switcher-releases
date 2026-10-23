@@ -153,7 +153,17 @@ impl Wizard {
 
     fn start_install(&mut self, ctx: &egui::Context) {
         self.mode = Mode::Install;
-        self.opts.dir = PathBuf::from(self.dir_text.trim());
+        let mut dir = PathBuf::from(self.dir_text.trim());
+        // Своя подпапка и для набранного вручную пути: программа не ложится россыпью
+        // в общую папку вроде D:\Tools.
+        if !self.updating() && !dir.ends_with("DnsSwitcher") {
+            dir.push("DnsSwitcher");
+        }
+        if !install::is_protected_dir(&dir) {
+            self.opts.no_uac = false;
+            self.opts.background = false;
+        }
+        self.opts.dir = dir;
         self.plan = install::install_plan();
         self.run_from(ctx, 0);
     }
@@ -401,8 +411,8 @@ impl Wizard {
             ui.add(
                 egui::Label::new(
                     RichText::new(
-                        "Папка вне Program Files: файл программы сможет подменить любая программа, \
-                         а запускается он с правами администратора. Надёжнее оставить Program Files.",
+                        "Папка вне Program Files: файл программы сможет подменить любая программа. \
+                         Поэтому запуск без UAC и фоновая защита здесь недоступны. Надёжнее оставить Program Files.",
                     )
                     .small()
                     .color(p.warn_text),
@@ -418,7 +428,14 @@ impl Wizard {
 
         ui.add_space(18.0);
         group_title(ui, "Запуск и защита");
-        ui.checkbox(&mut self.opts.no_uac, "Открывать без запроса прав администратора (UAC)");
+        let tasks_allowed = install::is_protected_dir(&dir);
+        if !tasks_allowed {
+            self.opts.no_uac = false;
+            self.opts.background = false;
+        }
+        ui.add_enabled_ui(tasks_allowed, |ui| {
+            ui.checkbox(&mut self.opts.no_uac, "Открывать без запроса прав администратора (UAC)");
+        });
         hint(
             ui,
             p,
@@ -426,7 +443,9 @@ impl Wizard {
              открывает её сразу, без окна подтверждения: через задание в Планировщике.",
         );
         ui.add_space(8.0);
-        ui.checkbox(&mut self.opts.background, "Фоновая защита от сбоев");
+        ui.add_enabled_ui(tasks_allowed, |ui| {
+            ui.checkbox(&mut self.opts.background, "Фоновая защита от сбоев");
+        });
         hint(
             ui,
             p,

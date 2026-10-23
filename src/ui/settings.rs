@@ -389,7 +389,7 @@ impl DnsApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new(data.to_string_lossy()).monospace());
             if ui.small_button("Открыть папку").clicked() {
-                let _ = std::process::Command::new("explorer").arg(&data).spawn();
+                crate::sys::open_in_explorer(&data);
             }
         });
         if let Some(dir) = install::installed_dir() {
@@ -404,7 +404,7 @@ impl DnsApp {
             }
             ui.label(RichText::new("·").color(p.text_weak));
             if ui.link(RichText::new("Выпуски и список изменений").color(p.accent_text)).clicked() {
-                let _ = std::process::Command::new("explorer").arg(format!("https://github.com/{}/releases", update::REPO)).spawn();
+                crate::sys::open_in_explorer(format!("https://github.com/{}/releases", update::REPO));
             }
         });
     }

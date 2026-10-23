@@ -1,6 +1,6 @@
 use crate::apply::{self, Action, Outcome};
 use crate::config::{Config, DnsServer, Failover, LastResort, default_servers, parse_ip_list};
-use crate::health::{self, Health, Method};
+use crate::health::{self, Grade, Health, Method};
 use crate::monitor;
 use crate::net::{self, Adapter};
 use crate::state::{self, RuntimeState};
@@ -211,6 +211,9 @@ impl DnsApp {
     fn debug_setup(&mut self, ctx: &egui::Context) {
         if std::env::var("DNS_SWITCHER_DEBUG_THEME").as_deref() == Ok("light") {
             ctx.set_theme(egui::Theme::Light);
+        }
+        if let Ok(name) = std::env::var("DNS_SWITCHER_DEBUG_SELECT") {
+            self.selected = self.config.servers.iter().position(|s| s.name == name);
         }
         match std::env::var("DNS_SWITCHER_DEBUG_DIALOG").as_deref() {
             Ok("failover") => self.failover_editor = Some(self.config.failover.clone()),
@@ -849,6 +852,23 @@ impl DnsApp {
                     ui.add_space(10.0);
                     ui.add(egui::Label::new(RichText::new(&server.note).color(p.text_weak)).wrap());
                 }
+                if let Some(HealthView::Done(h)) = self.health.get(&server.name) {
+                    if !h.services.is_empty() {
+                        ui.add_space(10.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for s in &h.services {
+                                let (state, fill, color) = if s.fully() {
+                                    ("открывается", p.accent_soft, p.accent_text)
+                                } else if s.works() {
+                                    ("с перебоями", p.surface_hover, p.warn_text)
+                                } else {
+                                    ("не открывается", p.surface_hover, p.danger_text)
+                                };
+                                badge(ui, fill, color, &format!("{}: {state}", s.name));
+                            }
+                        });
+                    }
+                }
                 ui.add_space(18.0);
 
                 let blocker = self.blocker();
@@ -978,6 +998,46 @@ impl DnsApp {
                     }
                 }
                 ui.label(RichText::new(format!("Проверка: {how}.")).small().color(p.text_weak));
+                if h.best_ms().is_some_and(|ms| ms > health::SLOW_MS) {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "DNS отвечает дольше 1,5 с: Windows не дождётся и уйдёт на страховочные \
+                                 Cloudflare и Google, а через них ИИ-сервисы не откроются.",
+                            )
+                            .small()
+                            .color(p.warn_text),
+                        )
+                        .wrap(),
+                    );
+                }
+                if !h.services.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Сервисы через этот DNS").family(semibold()));
+                    ui.add_space(2.0);
+                    for s in &h.services {
+                        let total = s.proxies.len();
+                        let (text, color) = if let Some(e) = &s.dns_error {
+                            (format!("не открывается: {e}"), p.danger_text)
+                        } else if !s.works() {
+                            (format!("не открывается: {}", s.first_error().unwrap_or("нет ответа")), p.danger_text)
+                        } else if s.fully() {
+                            let ms = s.best_ms().map(health::seconds).unwrap_or_default();
+                            (format!("открывается, {ms}"), p.success_text)
+                        } else {
+                            (format!("работает {} из {total} прокси", s.ok_count()), p.warn_text)
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(s.name);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new(text).color(color));
+                            });
+                        });
+                    }
+                    ui.label(
+                        RichText::new("Проверка: TLS-соединение с прокси, которые выдал DNS.").small().color(p.text_weak),
+                    );
+                }
             }
         }
     }
@@ -1397,11 +1457,17 @@ fn health_summary(p: &Palette, h: &HealthView) -> (String, Color32) {
         HealthView::Running => ("проверка…".into(), p.text_weak),
         HealthView::Done(h) if h.ips.is_empty() => ("нет адресов".into(), p.text_weak),
         HealthView::Done(h) => {
-            let (ok, total) = (h.ok_count(), h.ips.len());
-            match h.best_ms() {
-                None => ("не отвечает".into(), p.danger_text),
-                Some(ms) if ok == total => (format!("работает · {ms} мс"), p.text_weak),
-                Some(ms) => (format!("{ok} из {total} адресов · {ms} мс"), p.warn_text),
+            let ms = h.best_ms().map(health::seconds).unwrap_or_default();
+            match h.grade() {
+                Grade::Good => (format!("работает · {ms}"), p.text_weak),
+                Grade::PartialProxies => (format!("часть прокси не отвечает · {ms}"), p.warn_text),
+                Grade::Slow => (format!("медленно · {ms}"), p.warn_text),
+                Grade::ServiceDown => {
+                    let down: Vec<&str> = h.services.iter().filter(|s| !s.works()).map(|s| s.name).collect();
+                    let verb = if down.len() > 1 { "не открываются" } else { "не открывается" };
+                    (format!("{} {verb}", down.join(" и ")), p.danger_text)
+                }
+                Grade::Dead => ("не отвечает".into(), p.danger_text),
             }
         }
     }

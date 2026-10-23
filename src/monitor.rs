@@ -8,7 +8,7 @@
 
 use crate::apply::{self, Action};
 use crate::config::{Config, DnsServer, LastResort};
-use crate::health;
+use crate::health::{self, Grade, Health};
 use crate::net::{self, Adapter};
 use crate::state::{self, RuntimeState};
 use crate::tasks;
@@ -113,6 +113,8 @@ struct Watcher {
     fail_streak: u32,
     return_streak: u32,
     offline_logged: bool,
+    /// Уже записали в журнал, что лучше текущего сервера ничего нет.
+    stuck_logged: bool,
 }
 
 impl Watcher {
@@ -168,19 +170,21 @@ impl Watcher {
         }
 
         let health = health::check(&active, cfg.use_doh);
-        if health.alive() {
+        let grade = health.grade();
+        if grade.acceptable() {
             if self.fail_streak > 0 {
-                state::log(&format!("«{}» снова отвечает.", active.name));
+                state::log(&format!("«{}» снова работает нормально.", active.name));
             }
             self.fail_streak = 0;
             self.offline_logged = false;
+            self.stuck_logged = false;
             if cfg.failover.return_to_preferred && st.active != st.preferred {
                 self.try_return(cfg, &mut st, &adapters);
             }
             return;
         }
 
-        if !health::internet_ok() {
+        if grade == Grade::Dead && !health::internet_ok() {
             if !self.offline_logged {
                 state::log("Нет доступа в интернет. DNS не переключаю, жду, когда связь вернётся.");
                 self.offline_logged = true;
@@ -189,38 +193,52 @@ impl Watcher {
         }
         self.offline_logged = false;
         self.fail_streak += 1;
-        let reason = health.first_error().unwrap_or("нет ответа").to_string();
+        let reason = health.problem().unwrap_or_default();
         if self.fail_streak < FAILS_TO_SWITCH {
             state::log(&format!(
-                "«{}» не отвечает ({reason}). Перепроверю через {} с.",
+                "«{}»: {reason}. Перепроверю через {} с.",
                 active.name, cfg.failover.interval_secs
             ));
             return;
         }
 
-        self.fail_streak = 0;
-        self.return_streak = 0;
-        for candidate in candidates(cfg, &active) {
-            let h = health::check(candidate, cfg.use_doh);
-            if !h.alive() {
-                continue;
-            }
-            if switch_to(cfg, &mut st, &adapters, &health::prefer_working(candidate, &h)) {
-                state::log(&format!(
-                    "Переключено: «{}» не отвечает ({reason}), теперь работает «{}».",
-                    active.name, candidate.name
-                ));
+        // Ищем замену строго лучше текущего: сначала в той же группе, по порядку списка.
+        let (same, fallback) = candidates(cfg, &active);
+        if let Some((s, h)) = best(&check_all(cfg, &same), grade) {
+            if switch_to(cfg, &mut st, &adapters, &health::prefer_working(&s, &h)) {
+                state::log(&format!("Переключено: «{}» ({reason}), теперь работает «{}».", active.name, s.name));
+                *self = Watcher::default();
                 return;
             }
         }
-        go_dhcp(&mut st, &adapters, &format!("«{}» и все резервные серверы не отвечают", active.name));
+        if grade == Grade::Dead {
+            if let Some((s, h)) = best(&check_all(cfg, &fallback), Grade::Dead) {
+                if switch_to(cfg, &mut st, &adapters, &health::prefer_working(&s, &h)) {
+                    state::log(&format!(
+                        "Переключено на обычный DNS «{}»: «{}» и серверы для ИИ не отвечают. \
+                         Интернет работает, ИИ-сервисы могут не открываться.",
+                        s.name, active.name
+                    ));
+                    *self = Watcher::default();
+                    return;
+                }
+            }
+            go_dhcp(&mut st, &adapters, &format!("«{}» и все резервные серверы не отвечают", active.name));
+            *self = Watcher::default();
+            return;
+        }
+        // Текущий работает хотя бы частично, а лучше нет: оставляем и ищем дальше.
+        if !self.stuck_logged {
+            state::log(&format!("«{}»: {reason}. Лучше вариантов сейчас нет, оставляю его.", active.name));
+            self.stuck_logged = true;
+        }
     }
 
-    /// Вернуться к выбранному вручную серверу, если он стабильно отвечает.
+    /// Вернуться к выбранному вручную серверу, если он стабильно работает.
     fn try_return(&mut self, cfg: &Config, st: &mut RuntimeState, adapters: &[Adapter]) {
         let Some(preferred) = st.preferred.as_ref().and_then(|n| cfg.find(n)).cloned() else { return };
         let h = health::check(&preferred, cfg.use_doh);
-        if h.alive() {
+        if h.grade().acceptable() {
             self.return_streak += 1;
         } else {
             self.return_streak = 0;
@@ -231,32 +249,58 @@ impl Watcher {
         }
     }
 
-    /// Сейчас стоит DNS от роутера. Как только любой подходящий сервер ответит, ставим его.
+    /// Сейчас стоит DNS от роутера. Как только подходящий сервер ответит, ставим лучший.
     fn leave_dhcp(&mut self, cfg: &Config, st: &mut RuntimeState, adapters: &[Adapter]) {
         let Some(preferred) = st.preferred.as_ref().and_then(|n| cfg.find(n)).cloned() else { return };
-        let mut order = vec![&preferred];
-        order.extend(candidates(cfg, &preferred));
-        for s in order {
-            let h = health::check(s, cfg.use_doh);
-            if h.alive() && switch_to(cfg, st, adapters, &health::prefer_working(s, &h)) {
+        let (same, fallback) = candidates(cfg, &preferred);
+        let mut first = vec![preferred.clone()];
+        first.extend(same);
+        let found = best(&check_all(cfg, &first), Grade::Dead).or_else(|| best(&check_all(cfg, &fallback), Grade::Dead));
+        if let Some((s, h)) = found {
+            if switch_to(cfg, st, adapters, &health::prefer_working(&s, &h)) {
                 state::log(&format!("«{}» отвечает, переключил на него с DNS от роутера.", s.name));
-                return;
             }
         }
     }
 }
 
-/// Резервные серверы по порядку: сначала остальные из той же группы (в порядке списка,
-/// начиная со следующего), потом обычные DNS, если так разрешено настройками.
-fn candidates<'a>(cfg: &'a Config, current: &DnsServer) -> Vec<&'a DnsServer> {
+/// Резервные серверы: та же группа в порядке списка (порядок задаёт приоритет),
+/// и отдельно обычные DNS на крайний случай, если это разрешено настройками.
+fn candidates(cfg: &Config, current: &DnsServer) -> (Vec<DnsServer>, Vec<DnsServer>) {
     let usable = |s: &&DnsServer| s.name != current.name && (!s.doh_only || cfg.use_doh);
-    let pos = cfg.servers.iter().position(|s| s.name == current.name).unwrap_or(0);
-    let rotated = cfg.servers[pos + 1..].iter().chain(cfg.servers[..pos].iter());
-    let mut out: Vec<&DnsServer> = rotated.clone().filter(|s| s.ai_bypass == current.ai_bypass).filter(usable).collect();
-    if current.ai_bypass && cfg.failover.last_resort == LastResort::Regular {
-        out.extend(cfg.servers.iter().filter(|s| !s.ai_bypass).filter(usable));
-    }
-    out
+    let same = cfg.servers.iter().filter(|s| s.ai_bypass == current.ai_bypass).filter(usable).cloned().collect();
+    let fallback = if current.ai_bypass && cfg.failover.last_resort == LastResort::Regular {
+        cfg.servers.iter().filter(|s| !s.ai_bypass).filter(usable).cloned().collect()
+    } else {
+        Vec::new()
+    };
+    (same, fallback)
+}
+
+/// Проверяет серверы параллельно, порядок списка сохраняется.
+fn check_all(cfg: &Config, servers: &[DnsServer]) -> Vec<(DnsServer, Health)> {
+    let handles: Vec<_> = servers
+        .iter()
+        .cloned()
+        .map(|s| {
+            let use_doh = cfg.use_doh;
+            std::thread::spawn(move || {
+                let h = health::check(&s, use_doh);
+                (s, h)
+            })
+        })
+        .collect();
+    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+}
+
+/// Лучший сервер с оценкой строже `than`; при равной оценке выигрывает стоящий выше в списке.
+fn best(checked: &[(DnsServer, Health)], than: Grade) -> Option<(DnsServer, Health)> {
+    checked
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, h))| h.grade() < than)
+        .min_by_key(|(i, (_, h))| (h.grade(), *i))
+        .map(|(_, pair)| pair.clone())
 }
 
 fn switch_to(cfg: &Config, st: &mut RuntimeState, adapters: &[Adapter], server: &DnsServer) -> bool {
@@ -326,18 +370,18 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    fn names(list: Vec<&DnsServer>) -> Vec<String> {
-        list.into_iter().map(|s| s.name.clone()).collect()
+    fn names(list: Vec<DnsServer>) -> Vec<String> {
+        list.into_iter().map(|s| s.name).collect()
     }
 
     #[test]
-    fn candidates_follow_list_order_then_regular() {
+    fn candidates_keep_list_order_and_split_regular() {
         let cfg = Config::default();
         let comss = cfg.find("Comss DNS").unwrap();
-        assert_eq!(
-            names(candidates(&cfg, comss)),
-            ["Xbox-DNS", "dns-ai", "MagicDNS", "GeoHide DNS", "AdGuard DNS", "Google Public DNS", "Cloudflare"]
-        );
+        let (same, fallback) = candidates(&cfg, comss);
+        let ai: Vec<String> = cfg.servers.iter().filter(|s| s.ai_bypass && s.name != "Comss DNS").map(|s| s.name.clone()).collect();
+        assert_eq!(names(same), ai);
+        assert_eq!(names(fallback), ["AdGuard DNS", "Google Public DNS", "Cloudflare"]);
     }
 
     #[test]
@@ -345,14 +389,49 @@ mod tests {
         let mut cfg = Config::default();
         cfg.use_doh = false;
         cfg.failover.last_resort = LastResort::Dhcp;
-        let geo = cfg.find("GeoHide DNS").unwrap();
-        assert_eq!(names(candidates(&cfg, geo)), ["Comss DNS", "Xbox-DNS", "MagicDNS"]);
+        let (same, fallback) = candidates(&cfg, cfg.find("GeoHide EU").unwrap());
+        assert!(!names(same).contains(&"dns-ai".to_string()));
+        assert!(fallback.is_empty());
     }
 
     #[test]
-    fn regular_server_falls_back_only_to_regular() {
+    fn regular_server_has_no_separate_fallback() {
         let cfg = Config::default();
-        let google = cfg.find("Google Public DNS").unwrap();
-        assert_eq!(names(candidates(&cfg, google)), ["Cloudflare", "AdGuard DNS"]);
+        let (same, fallback) = candidates(&cfg, cfg.find("Google Public DNS").unwrap());
+        assert_eq!(names(same), ["AdGuard DNS", "Cloudflare"]);
+        assert!(fallback.is_empty());
+    }
+
+    fn fake(name: &str, dns_ms: Option<u32>, proxy_ok: bool) -> (DnsServer, Health) {
+        use crate::health::{IpHealth, Method, ServiceHealth};
+        let server = DnsServer {
+            name: name.into(),
+            ipv4: vec!["1.1.1.1".into()],
+            ipv6: vec![],
+            doh: String::new(),
+            ai_bypass: true,
+            doh_only: false,
+            note: String::new(),
+        };
+        let proxy = if proxy_ok { Ok(50) } else { Err("прокси не отвечает".to_string()) };
+        let h = Health {
+            method: Method::Udp,
+            ips: vec![IpHealth { ip: "1.1.1.1".into(), result: dns_ms.ok_or_else(|| "нет ответа".to_string()) }],
+            services: vec![ServiceHealth { name: "Gemini", dns_error: None, proxies: vec![(std::net::Ipv4Addr::LOCALHOST, proxy)] }],
+        };
+        (server, h)
+    }
+
+    #[test]
+    fn best_prefers_quality_then_list_order() {
+        let list = vec![
+            fake("slow", Some(5000), true),
+            fake("broken", Some(40), false),
+            fake("good-a", Some(60), true),
+            fake("good-b", Some(30), true),
+        ];
+        assert_eq!(best(&list, Grade::Dead).unwrap().0.name, "good-a");
+        assert!(best(&list[..2], Grade::Slow).is_none());
+        assert_eq!(best(&list[..2], Grade::ServiceDown).unwrap().0.name, "slow");
     }
 }

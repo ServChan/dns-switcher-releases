@@ -82,19 +82,19 @@ impl Wizard {
         let existing = install::installed_version().zip(install::installed_dir());
         let dir = existing.as_ref().map(|(_, d)| d.clone()).unwrap_or_else(install::default_dir);
         let manages_dns = install::manages_dns();
+        // При обновлении галочки показывают то, что установлено сейчас.
+        let opts = if existing.is_some() {
+            install::current_options()
+        } else {
+            InstallOptions { dir: dir.clone(), start_menu: true, desktop: true, no_uac: true, background: true }
+        };
         Self {
             mode,
             page: if mode == Mode::Uninstall { Page::UninstallConfirm } else { Page::Welcome },
             existing,
             maintenance: Maintenance::Update,
             dir_text: dir.to_string_lossy().to_string(),
-            opts: InstallOptions {
-                dir,
-                start_menu: true,
-                desktop: true,
-                no_uac: true,
-                background: true,
-            },
+            opts,
             un: UninstallOptions { reset_dns: manages_dns, remove_settings: false },
             manages_dns,
             plan: Vec::new(),

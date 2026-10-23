@@ -319,6 +319,12 @@ fn config_path() -> PathBuf {
     data_dir().join("config.json")
 }
 
+/// Когда файл настроек менялся в последний раз: окно по нему замечает, что
+/// настройки записал другой процесс (фоновая защита).
+pub fn config_stamp() -> Option<std::time::SystemTime> {
+    std::fs::metadata(config_path()).and_then(|m| m.modified()).ok()
+}
+
 /// Записывает файл целиком через временный, чтобы второй процесс не прочитал половину.
 pub fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {

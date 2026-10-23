@@ -1,6 +1,6 @@
 [package]
 name = "dns-switcher"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "Переключатель DNS для Windows"
 

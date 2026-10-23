@@ -183,6 +183,8 @@ pub struct DnsApp {
     browser_note: HashMap<String, (bool, String)>,
     /// Контекст окна: фоновые действия просят по нему перерисовку.
     ctx: egui::Context,
+    /// Время файла настроек, которое окно уже видело.
+    config_stamp: Option<std::time::SystemTime>,
     status: Option<Status>,
     busy: Option<String>,
     task_busy: bool,
@@ -229,6 +231,7 @@ impl DnsApp {
             auto_picking: false,
             new_probe: Default::default(),
             browser_note: HashMap::new(),
+            config_stamp: crate::config::config_stamp(),
             ctx: ctx.clone(),
             status: None,
             busy: None,
@@ -325,6 +328,7 @@ impl DnsApp {
             self.runtime = RuntimeState::load();
             self.log_tail = state::read_log(200);
             self.updates = update::UpdateState::load();
+            self.reload_config_if_changed();
         }
         if self.last_browsers.elapsed() >= Duration::from_secs(30) {
             self.start_browser_scan(ctx);
@@ -352,9 +356,30 @@ impl DnsApp {
     }
 
     fn save_config(&mut self) {
+        // Фоновая защита могла записать свежий список серверов: не затираем его.
+        if crate::config::config_stamp() != self.config_stamp {
+            let disk = Config::load();
+            if disk.remote_list_version > self.config.remote_list_version {
+                self.config.servers = disk.servers;
+                self.config.remote_list_version = disk.remote_list_version;
+            }
+        }
         if let Err(e) = self.config.save() {
             self.set_status(StatusKind::Error, e);
         }
+        self.config_stamp = crate::config::config_stamp();
+    }
+
+    /// Настройки изменил другой процесс: перечитываем, сохраняя выбранный сервер.
+    fn reload_config_if_changed(&mut self) {
+        let stamp = crate::config::config_stamp();
+        if stamp == self.config_stamp || self.editor.is_some() {
+            return;
+        }
+        let selected = self.selected.and_then(|i| self.config.servers.get(i)).map(|s| s.name.clone());
+        self.config = Config::load();
+        self.config_stamp = stamp;
+        self.selected = selected.and_then(|n| self.config.servers.iter().position(|s| s.name == n));
     }
 
     fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {

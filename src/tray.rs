@@ -10,7 +10,7 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
+    AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, MSGFLT_ALLOW, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     GetCursorPos, GetMessageW, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
     RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
@@ -95,7 +95,14 @@ pub fn start(tip: &str) {
             return;
         }
         let msg_name = wide("TaskbarCreated");
-        TASKBAR_CREATED.store(RegisterWindowMessageW(msg_name.as_ptr()) as isize, Ordering::Relaxed);
+        let taskbar_created = RegisterWindowMessageW(msg_name.as_ptr());
+        TASKBAR_CREATED.store(taskbar_created as isize, Ordering::Relaxed);
+        // Защита работает с правами администратора, а Проводник — без них. Windows не
+        // пропускает его сообщения «снизу вверх», пока окно само их не разрешит:
+        // иначе щелчки по значку и его возврат после перезапуска Проводника теряются.
+        for message in [WM_TRAY, taskbar_created] {
+            ChangeWindowMessageFilterEx(hwnd, message, MSGFLT_ALLOW, std::ptr::null_mut());
+        }
         HWND_VALUE.store(hwnd as isize, Ordering::Relaxed);
         add_icon(hwnd);
         let mut msg: MSG = std::mem::zeroed();

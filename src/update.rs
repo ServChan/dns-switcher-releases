@@ -200,6 +200,24 @@ fn get_once(url: &str) -> Result<(u16, String, Vec<u8>), String> {
 mod tests {
     use super::*;
 
+    /// Настоящий репозиторий выпусков: `cargo test -- --ignored --nocapture live_update`.
+    #[test]
+    #[ignore]
+    fn live_update_roundtrip() {
+        assert!(configured(), "ключ проверки не встроен");
+        let list = fetch_server_list().expect("список серверов скачался и подпись совпала");
+        println!("список версии {}: {} серверов", list.version, list.servers.len());
+        let body = http_get(MANIFEST_URL).expect("описание выпуска скачалось");
+        let m: Manifest = serde_json::from_slice(&body).expect("описание выпуска разобралось");
+        println!("выпуск {} ({})", m.version, m.url);
+        let path = download_app(&m).expect("установщик скачался, хеш и подпись совпали");
+        println!("установщик проверен: {} байт", std::fs::metadata(&path).unwrap().len());
+        let mut broken = m.clone();
+        broken.signature = B64.encode([0u8; 64]);
+        assert!(download_app(&broken).is_err(), "чужая подпись отвергается");
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn compares_versions() {
         assert!(newer("1.0.10", "1.0.9"));

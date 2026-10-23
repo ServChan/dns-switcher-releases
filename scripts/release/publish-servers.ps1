@@ -42,12 +42,14 @@ $work = Join-Path ([IO.Path]::GetTempPath()) ("dns-switcher-releases-" + [guid]:
 gh repo clone $Repo $work -- --depth 1 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "не удалось получить $Repo (gh repo create $Repo --public, если его ещё нет)" }
 try {
+    # Программа берёт список с ветки main; в пустом репозитории её ещё нет.
+    git -C $work checkout -B main 2>&1 | Out-Null
     Set-Content -Path "$work\.gitattributes" -Value '* -text' -NoNewline -Encoding ascii
     Copy-Item -Force $list "$work\servers.json"
     Copy-Item -Force $sig "$work\servers.json.sig"
     git -C $work add .gitattributes servers.json servers.json.sig
     git -C $work commit -m "Список серверов, версия $($json.version)" | Out-Null
-    git -C $work push 2>&1 | Out-Null
+    git -C $work push -u origin main 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'не удалось отправить список' }
     Write-Output "Опубликовано: https://github.com/$Repo/blob/main/servers.json"
 } finally {

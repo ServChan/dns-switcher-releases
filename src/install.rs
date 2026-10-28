@@ -92,7 +92,7 @@ pub fn uninstall_plan(opts: &UninstallOptions) -> Vec<Step> {
 // ---------- Где что лежит ----------
 
 pub fn default_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| r"C:\Program Files".into());
+    let base = crate::sys::known_folder(crate::sys::Folder::ProgramFiles).unwrap_or_else(|| r"C:\Program Files".into());
     base.join("DnsSwitcher")
 }
 
@@ -130,9 +130,13 @@ pub fn running_installed() -> bool {
 /// Папка внутри Program Files: менять там файлы может только администратор.
 /// Это важно, потому что задания запускают программу с наивысшими правами.
 pub fn is_protected_dir(dir: &Path) -> bool {
-    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
-        .iter()
-        .any(|var| std::env::var_os(var).is_some_and(|base| crate::sys::is_inside(dir, Path::new(&base))))
+    // Сами папки берутся у Windows: переменные окружения пользователь может подменить.
+    use crate::sys::{Folder, is_inside, known_folder};
+    dir.is_absolute()
+        && [Folder::ProgramFiles, Folder::ProgramFilesX86]
+            .into_iter()
+            .filter_map(known_folder)
+            .any(|base| is_inside(dir, &base))
 }
 
 /// Копия, установленная прежними версиями вне Program Files: её задания запускали бы
@@ -167,13 +171,14 @@ pub fn manages_dns() -> bool {
 }
 
 fn start_menu_link() -> PathBuf {
-    let base = std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| r"C:\ProgramData".into());
-    base.join(r"Microsoft\Windows\Start Menu\Programs").join(format!("{APP_NAME}.lnk"))
+    let base = crate::sys::known_folder(crate::sys::Folder::CommonPrograms)
+        .unwrap_or_else(|| r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs".into());
+    base.join(format!("{APP_NAME}.lnk"))
 }
 
 fn desktop_link() -> PathBuf {
-    let base = std::env::var_os("PUBLIC").map(PathBuf::from).unwrap_or_else(|| r"C:\Users\Public".into());
-    base.join("Desktop").join(format!("{APP_NAME}.lnk"))
+    let base = crate::sys::known_folder(crate::sys::Folder::PublicDesktop).unwrap_or_else(|| r"C:\Users\Public\Desktop".into());
+    base.join(format!("{APP_NAME}.lnk"))
 }
 
 // ---------- Выполнение шагов ----------
@@ -258,10 +263,13 @@ pub fn run_uninstall_step(step: Step, dir: Option<&Path>) -> Result<(), String> 
                 _ => Ok(()),
             }
         }
-        Step::RemoveSettings => match std::fs::remove_dir_all(data_dir()) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("Не удалось удалить настройки: {e}")),
-            _ => Ok(()),
-        },
+        Step::RemoveSettings => {
+            let _ = std::fs::remove_dir_all(crate::config::legacy_data_dir());
+            match std::fs::remove_dir_all(data_dir()) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("Не удалось удалить настройки: {e}")),
+                _ => Ok(()),
+            }
+        }
         Step::RemoveFiles => {
             // Папку запоминает мастер до начала: запись в реестре к этому шагу уже удалена.
             // Удаляются только свои файлы: папку могли выбрать общую (например, D:\Tools),
@@ -299,11 +307,19 @@ fn schedule_dir_removal(dir: &Path) {
     let d = dir.display();
     let exe = dir.join(EXE_NAME);
     let e = exe.display();
+    let ping = crate::sys::tool("ping");
+    let p = ping.display();
     let cmd = format!(
-        "/C \"for /L %i in (1,1,120) do @(if exist \"{e}\" (del /f /q \"{e}\" 2>nul & ping -n 2 127.0.0.1 >nul)) & rmdir \"{d}\" 2>nul\""
+        "/C \"for /L %i in (1,1,120) do @(if exist \"{e}\" (del /f /q \"{e}\" 2>nul & \"{p}\" -n 2 127.0.0.1 >nul)) & rmdir \"{d}\" 2>nul\""
     );
+    // Знак % в имени папки cmd понял бы как переменную: такую папку не трогаем.
+    if dir.to_string_lossy().contains('%') {
+        return;
+    }
     let _ = Command::new(crate::sys::tool("cmd"))
         .raw_arg(cmd)
+        // Рабочая папка cmd — системная: из текущей он мог бы взять подложенную утилиту.
+        .current_dir(crate::sys::system_dir())
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn();
 }
@@ -384,12 +400,34 @@ pub fn current_options() -> InstallOptions {
 }
 
 /// `--update`: тихое обновление без окна мастера, затем запуск программы.
+/// Ярлыки и запись в «Приложениях» не обязательны: их сбой не мешает обновлению.
+/// Что бы ни случилось после остановки программы, фоновая защита и окно
+/// запускаются снова, иначе компьютер остался бы без защиты.
 pub fn silent_update() -> Result<(), String> {
-    let opts = current_options();
-    for step in install_plan() {
-        run_install_step(step, &opts).map_err(|e| format!("{}: {e}", step.title()))?;
+    if let Some(have) = installed_version().filter(|v| crate::update::newer(v, VERSION)) {
+        return Err(format!("уже установлена более новая версия {have}, а это {VERSION}"));
     }
-    launch(&opts.dir)
+    let opts = current_options();
+    let mut result = Ok(());
+    let mut warnings = Vec::new();
+    for step in install_plan() {
+        match run_install_step(step, &opts) {
+            Ok(()) => {}
+            Err(e) if matches!(step, Step::Shortcuts | Step::Register) => warnings.push(format!("{}: {e}", step.title())),
+            Err(e) => {
+                result = Err(format!("{}: {e}", step.title()));
+                break;
+            }
+        }
+    }
+    for w in &warnings {
+        state::log(&format!("Обновление: {w}"));
+    }
+    if result.is_err() && opts.background {
+        let _ = tasks::run(tasks::WATCHDOG);
+    }
+    let launched = launch(&opts.dir);
+    result.and(launched)
 }
 
 /// Запускает установленную программу отдельно от установщика.

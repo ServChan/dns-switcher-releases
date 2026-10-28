@@ -8,8 +8,15 @@ pub const WATCHDOG: &str = "DnsSwitcher Watchdog";
 /// Запуск окна с правами администратора без подтверждения UAC.
 pub const LAUNCHER: &str = "DnsSwitcher Launcher";
 
+/// Есть ли задание. Смотрим в реестр Планировщика: сбой запуска schtasks не должен
+/// выглядеть как «задания нет», иначе обновление выключило бы его.
 pub fn exists(name: &str) -> bool {
-    apply::run_tool("schtasks", &["/Query", "/TN", name]).is_ok()
+    let tree = format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\{name}");
+    match winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE).open_subkey(tree) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => apply::run_tool("schtasks", &["/Query", "/TN", name]).is_ok(),
+    }
 }
 
 pub fn run(name: &str) -> Result<(), String> {
@@ -36,12 +43,20 @@ pub fn create(name: &str, exe: &Path, args: &str, at_logon: bool, description: &
             exe.display()
         ));
     };
-    let user = format!(
-        "{}\\{}",
-        std::env::var("USERDOMAIN").unwrap_or_default(),
-        std::env::var("USERNAME").unwrap_or_default()
-    );
-    let user = xml_escape(&user);
+    // Задание запускается при входе того, кто сидит за компьютером. Если права
+    // администратора получены паролем другой учётной записи, у этого пользователя
+    // их нет, и задание с «наивысшими правами» не смогло бы менять DNS.
+    let session = crate::sys::session_user().ok_or("не удалось узнать пользователя Windows")?;
+    if let Some(me) = crate::sys::process_user() {
+        let short = |s: &str| s.rsplit('\\').next().unwrap_or(s).to_lowercase();
+        if short(&me) != short(&session) {
+            return Err(format!(
+                "Задание «{name}» работает только для учётной записи администратора, а программа открыта под {me}, \
+                 пока в Windows вошёл {session}. Войдите в Windows под учётной записью администратора и повторите."
+            ));
+        }
+    }
+    let user = xml_escape(&session);
     let triggers = if at_logon {
         format!("<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>")
     } else {

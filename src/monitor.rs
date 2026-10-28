@@ -21,7 +21,9 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows_sys::Win32::System::Threading::{CreateMutexW, OpenMutexW};
 
-const LOCK_NAME: &str = "Local\\DnsSwitcherWatch";
+/// Global: DNS общий для всего компьютера, следить за ним должен один процесс
+/// на все сеансы Windows, иначе защиты двух пользователей спорили бы друг с другом.
+const LOCK_NAME: &str = "Global\\DnsSwitcherWatch";
 const SYNCHRONIZE: u32 = 0x0010_0000;
 /// Сколько проверок подряд сервер должен не отвечать, чтобы переключиться.
 const FAILS_TO_SWITCH: u32 = 2;
@@ -37,6 +39,8 @@ const CALM_AFTER: Duration = Duration::from_secs(2 * 3600);
 const SWEEP_EVERY: Duration = Duration::from_secs(300);
 /// Сколько последних оценок хранить на сервер.
 const HISTORY_LEN: usize = 6;
+/// Через сколько повторить проверку обновлений, если она не удалась.
+const RETRY_UPDATE_SECS: u64 = 3600;
 /// Как часто смотреть настройки браузеров.
 const BROWSERS_EVERY: Duration = Duration::from_secs(600);
 
@@ -129,9 +133,17 @@ fn server_has_ip(s: &DnsServer, ip: &IpAddr) -> bool {
     s.all_ips().any(|x| x.parse::<IpAddr>().ok().as_ref() == Some(ip))
 }
 
-/// Основной DNS подключения: первый IPv4, а если их нет, первый IPv6.
-fn primary_dns(a: &Adapter) -> Option<&IpAddr> {
-    a.dns.iter().find(|ip| ip.is_ipv4()).or_else(|| a.dns.first())
+/// Стоит ли сервер основным DNS подключения. Сравнивается первый адрес того
+/// семейства, в котором у сервера есть адреса: у сервера только с IPv6 первым
+/// IPv4 на подключении окажется страховочный 1.1.1.1 или адрес роутера.
+pub(crate) fn adapter_uses(a: &Adapter, s: &DnsServer) -> bool {
+    let v4 = !s.ipv4.is_empty();
+    a.dns.iter().find(|ip| ip.is_ipv4() == v4).is_some_and(|ip| server_has_ip(s, ip))
+}
+
+/// Сервер можно поставить при текущих настройках (сервер «только DoH» — при включённом DoH).
+fn usable(cfg: &Config, s: &DnsServer) -> bool {
+    !s.doh_only || cfg.use_doh
 }
 
 /// Сколько ждать после смены сервера из-за сквозной проверки, прежде чем винить
@@ -147,6 +159,9 @@ struct Watcher {
     stuck_logged: bool,
     /// Сколько проверок подряд Windows получает ответы не от выбранного сервера.
     e2e_fail: u32,
+    /// Состояние, которое защита видела на прошлой проверке. Если его поменяло окно
+    /// («Применить», «Сбросить»), счётчики относятся к другому серверу и сбрасываются.
+    seen: Option<(Option<String>, Option<String>, bool, Vec<String>)>,
     mem: Memory,
 }
 
@@ -202,7 +217,12 @@ impl Watcher {
         }
         self.mem.last_sweep = Some(Instant::now());
         let ai: Vec<DnsServer> = cfg.servers.iter().filter(|s| s.ai_bypass).cloned().collect();
-        for (s, h) in check_all(cfg, &ai) {
+        let checked = check_all(cfg, &ai);
+        // Без интернета все серверы «не отвечают»: в историю надёжности это не пишем.
+        if checked.iter().all(|(_, h)| h.grade() == Grade::Dead) && !health::internet_ok() {
+            return;
+        }
+        for (s, h) in checked {
             self.remember(&s.name, h.grade());
         }
         self.mem.snapshot.save();
@@ -223,7 +243,7 @@ impl Watcher {
         if told != self.mem.browsers_told {
             if !own.is_empty() {
                 state::log(&format!(
-                    "{} пользуется своим защищённым DNS в обход Windows: обход ограничений там не действует.",
+                    "{} обходит DNS Windows (свой защищённый DNS или режим «автоматически»): обход ограничений там не действует.",
                     told
                 ));
                 if cfg.notify.problems {
@@ -259,7 +279,10 @@ impl Watcher {
                         state::log(&format!("Список серверов обновлён до версии {}: {}.", list.version, changes.join(", ")));
                     }
                 }
-                Err(e) => state::log(&format!("Список серверов не обновлён: {e}.")),
+                Err(e) => {
+                    state::log(&format!("Список серверов не обновлён: {e}. Попробую снова через час."));
+                    us.last_list_check = now.saturating_sub(update::CHECK_EVERY_SECS - RETRY_UPDATE_SECS);
+                }
             }
         }
         if app_due {
@@ -278,7 +301,10 @@ impl Watcher {
                     us.available = Some(m);
                 }
                 Ok(None) => us.available = None,
-                Err(e) => state::log(&format!("Проверка обновлений не удалась: {e}.")),
+                Err(e) => {
+                    state::log(&format!("Проверка обновлений не удалась: {e}. Попробую снова через час."));
+                    us.last_app_check = now.saturating_sub(update::CHECK_EVERY_SECS - RETRY_UPDATE_SECS);
+                }
             }
         }
         us.save();
@@ -314,6 +340,11 @@ impl Watcher {
         let cfg = &fresh_cfg;
         self.sweep(cfg);
         let mut st = RuntimeState::load();
+        let now = (st.preferred.clone(), st.active.clone(), st.on_dhcp_fallback, st.adapters.clone());
+        if self.seen.as_ref().is_some_and(|seen| *seen != now) {
+            self.reset();
+        }
+        self.seen = Some(now);
         if st.preferred.is_none() {
             self.reset();
             tray::set_tip("Переключатель DNS: сервер не выбран");
@@ -351,7 +382,7 @@ impl Watcher {
         // активный сервер, которого больше нет в списке: ищем, чей адрес стоит.
         let in_use = active
             .as_ref()
-            .is_some_and(|act| up.iter().any(|a| primary_dns(a).is_some_and(|ip| server_has_ip(act, ip))));
+            .is_some_and(|act| up.iter().any(|a| adapter_uses(a, act)));
         let Some(active) = active.filter(|_| in_use) else {
             // Пока шли проверки, окно могло применить другой сервер или обновить
             // список: решаем по свежим данным, а если состояние уже сменилось, ждём.
@@ -362,7 +393,7 @@ impl Watcher {
             let other = cfg_now
                 .servers
                 .iter()
-                .find(|s| up.iter().any(|a| primary_dns(a).is_some_and(|ip| server_has_ip(s, ip))));
+                .find(|s| up.iter().any(|a| adapter_uses(a, s)));
             if other.is_some_and(|s| st.active.as_deref() == Some(s.name.as_str())) {
                 return; // тот же сервер, адреса обновил список
             }
@@ -389,7 +420,10 @@ impl Watcher {
         let mut grade = health.grade();
         // Причина, когда сбой нашла сквозная проверка, а не проверка самого сервера.
         let mut forced_reason: Option<String> = None;
-        self.remember(&active.name, grade);
+        // Без интернета сервер ни при чём: в историю надёжности это не пишем.
+        if grade != Grade::Dead || health::internet_ok() {
+            self.remember(&active.name, grade);
+        }
 
         // IPv6: сервер отдаёт настоящий адрес, а у подключения есть IPv6 — обход течёт.
         let leak: Vec<&str> = health.services.iter().filter(|s| s.ipv6_leak).map(|s| s.name.as_str()).collect();
@@ -502,6 +536,24 @@ impl Watcher {
             return;
         }
 
+        // Стоит обычный резервный DNS, а выбран сервер для ИИ: сначала смотрим, не
+        // заработал ли он сам или другой сервер для ИИ.
+        if let Some(pref) = st.preferred.as_ref().and_then(|n| cfg.find(n)).filter(|p| p.ai_bypass && !active.ai_bypass) {
+            let ai = ai_group(cfg, pref);
+            let checked_ai = check_all(cfg, &ai);
+            for (s, h) in &checked_ai {
+                self.remember(&s.name, h.grade());
+            }
+            if let Some((s, h)) = best(&checked_ai, Grade::Slow, |n| self.history_rank(n)) {
+                if switch_to(cfg, &mut st, &adapters, &health::prefer_working(&s, &h)) {
+                    state::log(&format!("Переключено с обычного «{}» на «{}». Причина: «{}» — {reason}.", active.name, s.name, active.name));
+                    state::log(&choice_note(&s.name, &h, &checked_ai));
+                    self.reset();
+                    return;
+                }
+            }
+        }
+
         // Ищем замену строго лучше текущего: сначала в той же группе, по порядку списка.
         let (same, fallback) = candidates(cfg, &active);
         let checked = check_all(cfg, &same);
@@ -575,7 +627,9 @@ impl Watcher {
 
     /// Вернуться к выбранному вручную серверу, если он стабильно работает.
     fn try_return(&mut self, cfg: &Config, st: &mut RuntimeState, adapters: &[Adapter]) {
-        let Some(preferred) = st.preferred.as_ref().and_then(|n| cfg.find(n)).cloned() else { return };
+        let Some(preferred) = st.preferred.as_ref().and_then(|n| cfg.find(n)).filter(|p| usable(cfg, p)).cloned() else {
+            return;
+        };
         let h = health::check(&preferred, cfg.use_doh, &cfg.probes, Depth::Quick);
         if h.grade().acceptable() {
             self.return_streak += 1;
@@ -584,7 +638,8 @@ impl Watcher {
         }
         let needed = self.mem.return_needed.max(OKS_TO_RETURN);
         if self.return_streak >= needed && switch_to(cfg, st, adapters, &health::prefer_working(&preferred, &h)) {
-            self.return_streak = 0;
+            // Счётчики сбоев относились к резервному серверу.
+            self.reset();
             self.mem.returned_at = Some(Instant::now());
             state::log(&format!("«{}» снова работает, вернул его.", preferred.name));
             if cfg.notify.switches {
@@ -601,8 +656,7 @@ impl Watcher {
             return;
         }
         self.mem.last_upgrade = Some(Instant::now());
-        let (same, _) = candidates(cfg, &preferred);
-        let checked = check_all(cfg, &same);
+        let checked = check_all(cfg, &ai_group(cfg, &preferred));
         for (s, h) in &checked {
             self.remember(&s.name, h.grade());
         }
@@ -632,18 +686,14 @@ impl Watcher {
         else {
             return;
         };
-        let (same, fallback) = candidates(cfg, &preferred);
-        let mut first = vec![preferred.clone()];
-        first.extend(same);
-        let mut checked = check_all(cfg, &first);
-        let mut found = best(&checked, Grade::Dead, |n| self.history_rank(n));
-        if found.is_none() {
+        let (_, fallback) = candidates(cfg, &preferred);
+        let mut checked = check_all(cfg, &ai_group(cfg, &preferred));
+        if best(&checked, Grade::Dead, |n| self.history_rank(n)).is_none() {
             checked = check_all(cfg, &fallback);
-            found = best(&checked, Grade::Dead, |n| self.history_rank(n));
         }
         // Две удачи подряд: сервер, который то отвечает, то нет, не гоняет
         // подключение туда-обратно с DNS роутера.
-        if found.is_some() {
+        if best(&checked, Grade::Dead, |n| self.history_rank(n)).is_some() {
             self.return_streak += 1;
         } else {
             self.return_streak = 0;
@@ -651,7 +701,9 @@ impl Watcher {
         if self.return_streak < 2 {
             return;
         }
-        if let Some((s, h)) = found {
+        // Если лучший не встал, пробуем следующий: иначе защита застряла бы на нём.
+        let mut left = checked.clone();
+        while let Some((s, h)) = best(&left, Grade::Dead, |n| self.history_rank(n)) {
             if switch_to(cfg, st, adapters, &health::prefer_working(&s, &h)) {
                 self.return_streak = 0;
                 state::log(&format!("«{}» отвечает, переключил на него с DNS от роутера.", s.name));
@@ -659,6 +711,11 @@ impl Watcher {
                 if cfg.notify.switches {
                     tray::notify(&format!("Снова работает «{}»", s.name), "DNS от роутера больше не нужен.", false);
                 }
+                return;
+            }
+            left.retain(|(x, _)| x.name != s.name);
+            if state_changed(st) {
+                return;
             }
         }
     }
@@ -687,12 +744,22 @@ pub(crate) fn apply_list(list: &crate::config::ServerList) -> Vec<String> {
                 .into_iter()
                 .filter(|x| st.adapters.contains(&x.guid))
                 .collect();
-            if switch_to(&fresh, &mut st, &adapters, &a) {
+            if switch_with(&fresh, &mut st, &adapters, &a, false) {
                 state::log(&format!("У «{}» новые адреса из списка, применил их.", a.name));
             }
         }
     }
     changes
+}
+
+/// Выбранный сервер и остальные его группы, которые можно поставить: выбранный первым.
+fn ai_group(cfg: &Config, preferred: &DnsServer) -> Vec<DnsServer> {
+    let mut list: Vec<DnsServer> = Vec::new();
+    if usable(cfg, preferred) {
+        list.push(preferred.clone());
+    }
+    list.extend(candidates(cfg, preferred).0);
+    list
 }
 
 /// Резервные серверы: та же группа в порядке списка (порядок задаёт приоритет),
@@ -754,11 +821,35 @@ pub(crate) fn best(checked: &[(DnsServer, Health)], than: Grade, rank: impl Fn(&
 /// в окне. Тогда решение защиты устарело, и менять DNS нельзя.
 fn state_changed(st: &RuntimeState) -> bool {
     let disk = RuntimeState::load();
-    disk.preferred != st.preferred || disk.active != st.active || disk.on_dhcp_fallback != st.on_dhcp_fallback
+    disk.preferred != st.preferred
+        || disk.active != st.active
+        || disk.on_dhcp_fallback != st.on_dhcp_fallback
+        || disk.adapters != st.adapters
 }
 
+/// Ставит сервер. Проверка «состояние не менялось», смена DNS и запись состояния
+/// идут под одним замком: окно не может вклиниться между ними со своим выбором.
+/// Настройки (DoH, страховка, включена ли защита) берутся свежие: проверки перед
+/// этим могли идти минуту.
 fn switch_to(cfg: &Config, st: &mut RuntimeState, adapters: &[Adapter], server: &DnsServer) -> bool {
+    switch_with(cfg, st, adapters, server, true)
+}
+
+/// `require_failover`: защита, выключенная за время проверок, ничего не меняет.
+/// Новые адреса того же сервера из списка ставятся и без неё.
+fn switch_with(_cfg: &Config, st: &mut RuntimeState, adapters: &[Adapter], server: &DnsServer, require_failover: bool) -> bool {
+    let lock = match apply::lock() {
+        Ok(l) => l,
+        Err(e) => {
+            state::log(&format!("Не удалось поставить «{}»: {e}", server.name));
+            return false;
+        }
+    };
     if state_changed(st) {
+        return false;
+    }
+    let cfg = Config::load();
+    if require_failover && !cfg.failover.enabled {
         return false;
     }
     let action = Action::Apply {
@@ -766,7 +857,7 @@ fn switch_to(cfg: &Config, st: &mut RuntimeState, adapters: &[Adapter], server: 
         use_doh: cfg.use_doh,
         safety_net: cfg.failover.safety_net,
     };
-    let outcomes = apply::run(&action, adapters);
+    let outcomes = apply::run_locked(&lock, &action, adapters);
     let ok = outcomes.iter().any(|o| o.result.is_ok());
     if !ok {
         let errors: Vec<String> = outcomes
@@ -784,10 +875,11 @@ fn switch_to(cfg: &Config, st: &mut RuntimeState, adapters: &[Adapter], server: 
 
 /// Возвращает true, если DNS от роутера включён.
 fn go_dhcp(st: &mut RuntimeState, adapters: &[Adapter], reason: &str) -> bool {
-    if state_changed(st) {
+    let Ok(lock) = apply::lock() else { return false };
+    if state_changed(st) || !Config::load().failover.enabled {
         return false;
     }
-    let outcomes = apply::run(&Action::Reset, adapters);
+    let outcomes = apply::run_locked(&lock, &Action::Reset, adapters);
     if outcomes.iter().any(|o| o.result.is_ok()) {
         st.on_dhcp_fallback = true;
         let _ = st.save();

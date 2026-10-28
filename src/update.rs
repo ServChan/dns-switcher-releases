@@ -41,6 +41,20 @@ pub struct Manifest {
     pub sha256: String,
     /// Подпись ed25519 содержимого exe, base64.
     pub signature: String,
+    /// Подпись ed25519 строки «версия и хеш» (`release_text`): без неё старый
+    /// подписанный установщик можно было бы выдать за новую версию.
+    #[serde(default)]
+    pub release_signature: String,
+}
+
+/// Что подписывается вместе с версией: так версию нельзя подменить отдельно от файла.
+pub fn release_text(version: &str, sha256: &str) -> String {
+    format!("dns-switcher-release\n{}\n{}\n", version.trim(), sha256.trim().to_lowercase())
+}
+
+/// Версия вида 1.2.3: только цифры и точки, она попадает в имена и сравнения.
+fn valid_version(v: &str) -> bool {
+    !v.is_empty() && v.len() <= 20 && v.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Когда что проверялось; хранится рядом с настройками.
@@ -101,11 +115,25 @@ fn verify(data: &[u8], signature_b64: &str) -> Result<(), String> {
 pub fn check_app() -> Result<Option<Manifest>, String> {
     let body = http_get(MANIFEST_URL)?;
     let m: Manifest = serde_json::from_slice(&body).map_err(|_| "описание выпуска не разобралось".to_string())?;
+    if !valid_version(&m.version) {
+        return Err("в описании выпуска неверная версия".into());
+    }
     Ok(newer(&m.version, crate::install::VERSION).then_some(m))
 }
 
-/// Скачивает установщик новой версии и проверяет хеш и подпись.
-pub fn download_app(m: &Manifest) -> Result<PathBuf, String> {
+/// Скачивает установщик новой версии и проверяет хеш и подпись. Описание выпуска
+/// берётся свежее с GitHub, а не из сохранённого updates.json.
+pub fn download_app() -> Result<PathBuf, String> {
+    let m = check_app()?.ok_or("новой версии нет")?;
+    download_verified(&m)
+}
+
+fn download_verified(m: &Manifest) -> Result<PathBuf, String> {
+    if !valid_version(&m.version) || !newer(&m.version, crate::install::VERSION) {
+        return Err("это не новая версия".into());
+    }
+    verify(release_text(&m.version, &m.sha256).as_bytes(), &m.release_signature)
+        .map_err(|_| "подпись версии не совпала: описание выпуска могли подменить, обновление отменено".to_string())?;
     let data = http_get(&m.url)?;
     let hash: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
     if !hash.eq_ignore_ascii_case(m.sha256.trim()) {
@@ -121,7 +149,8 @@ pub fn download_app(m: &Manifest) -> Result<PathBuf, String> {
     // Прежние скачанные установщики больше не нужны.
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("не удалось создать {}: {e}", dir.display()))?;
-    let path = dir.join(format!("DnsSwitcher-Setup-{}.exe", m.version));
+    // Своё имя: прежний установщик мог ещё работать (например, показывать ошибку).
+    let path = dir.join(format!("DnsSwitcher-Setup-{}.exe", crate::sys::random_suffix()));
     std::fs::write(&path, &data).map_err(|e| format!("не удалось сохранить установщик: {e}"))?;
     Ok(path)
 }
@@ -149,7 +178,17 @@ pub fn fetch_server_list() -> Result<ServerList, String> {
 fn http_get(url: &str) -> Result<Vec<u8>, String> {
     let mut url = url.to_string();
     for _ in 0..6 {
-        let (status, headers, body) = get_once(&url)?;
+        // Соединение изредка портится по пути (испорченная TLS-запись) или рвётся,
+        // пока DNS только что сменили: до трёх попыток с паузой.
+        let mut attempt = get_once(&url);
+        for pause in [1, 3] {
+            if attempt.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(pause));
+            attempt = get_once(&url);
+        }
+        let (status, headers, body) = attempt?;
         match status {
             200 => return Ok(body),
             301 | 302 | 303 | 307 | 308 => {
@@ -219,12 +258,21 @@ mod tests {
         let body = http_get(MANIFEST_URL).expect("описание выпуска скачалось");
         let m: Manifest = serde_json::from_slice(&body).expect("описание выпуска разобралось");
         println!("выпуск {} ({})", m.version, m.url);
-        let path = download_app(&m).expect("установщик скачался, хеш и подпись совпали");
-        println!("установщик проверен: {} байт", std::fs::metadata(&path).unwrap().len());
+        verify(release_text(&m.version, &m.sha256).as_bytes(), &m.release_signature).expect("подпись версии совпала");
+        let data = http_get(&m.url).expect("установщик скачался");
+        verify(&data, &m.signature).expect("подпись установщика совпала");
+        println!("установщик проверен: {} байт", data.len());
         let mut broken = m.clone();
-        broken.signature = B64.encode([0u8; 64]);
-        assert!(download_app(&broken).is_err(), "чужая подпись отвергается");
-        let _ = std::fs::remove_file(path);
+        broken.version = "99.0.0".into();
+        assert!(download_verified(&broken).is_err(), "подменённая версия отвергается");
+    }
+
+    #[test]
+    fn versions_are_digits_and_dots() {
+        assert!(valid_version("1.0.2"));
+        assert!(!valid_version(r"1\..\..\x"));
+        assert!(!valid_version("1..2"));
+        assert!(!valid_version(""));
     }
 
     #[test]

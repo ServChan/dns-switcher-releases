@@ -9,7 +9,9 @@ use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 pub enum DnsMode {
     /// Пользуется DNS Windows: программа на него действует.
     System,
-    /// «Автоматически»: DNS Windows, при известном провайдере с шифрованием. Тоже годится.
+    /// «Автоматически»: DNS Windows, но адреса известных провайдеров (Cloudflare,
+    /// Google) браузер сам переводит на их DoH. Программа дописывает 1.1.1.1 и 8.8.8.8
+    /// страховкой, и тогда браузер ходит к ним напрямую, мимо выбранного сервера.
     Automatic,
     /// Свой защищённый DNS: Windows и программа в обход.
     Own,
@@ -42,7 +44,15 @@ enum Kind {
 
 impl BrowserDns {
     pub fn bypasses_windows(&self) -> bool {
-        self.mode == DnsMode::Own
+        self.mode != DnsMode::System
+    }
+
+    /// Почему браузер идёт мимо DNS Windows, одной фразой.
+    pub fn bypass_reason(&self) -> &'static str {
+        match self.mode {
+            DnsMode::Automatic => "в режиме «автоматически» он сам переходит на защищённый DNS Cloudflare и Google, поэтому обход в нём не работает.",
+            _ => "у него свой защищённый DNS, поэтому обход в нём не работает.",
+        }
     }
 
     pub fn can_fix(&self) -> bool {
@@ -150,7 +160,7 @@ pub fn detect() -> Vec<BrowserDns> {
     let procs = processes();
     let mut out = Vec::new();
     for b in &CHROMIUM {
-        let base = std::env::var_os(if b.roaming { "APPDATA" } else { "LOCALAPPDATA" }).map(PathBuf::from);
+        let base = crate::sys::known_folder(if b.roaming { crate::sys::Folder::RoamingAppData } else { crate::sys::Folder::LocalAppData });
         let Some(local_state) = base.and_then(|base| {
             b.dirs.iter().map(|d| base.join(d).join("Local State")).find(|p| p.exists())
         }) else {
@@ -179,7 +189,7 @@ pub fn detect() -> Vec<BrowserDns> {
         out.push(ff);
     }
     for b in &mut out {
-        b.running = !browser_pids(b, &procs).is_empty();
+        b.running = !browser_pids(b, &procs).is_empty() || unknown_same_exe(b, &procs);
     }
     out
 }
@@ -215,7 +225,7 @@ fn chromium_policy(key: &str) -> Option<(DnsMode, String)> {
 }
 
 fn firefox() -> Option<BrowserDns> {
-    let root = PathBuf::from(std::env::var_os("APPDATA")?).join(r"Mozilla\Firefox");
+    let root = crate::sys::known_folder(crate::sys::Folder::RoamingAppData)?.join(r"Mozilla\Firefox");
     let ini = std::fs::read_to_string(root.join("profiles.ini")).ok()?;
     let mut prefs = Vec::new();
     let mut is_relative = true;
@@ -239,19 +249,27 @@ fn firefox() -> Option<BrowserDns> {
     // Режимы TRR: 2 и 3 — свой DoH, остальное — DNS системы.
     let mut mode = DnsMode::System;
     let mut template = String::new();
+    // user.js перекрывает prefs.js при каждом запуске, поэтому смотрим оба.
     for file in &prefs {
-        let text = std::fs::read_to_string(file).unwrap_or_default();
-        if let Some(m) = firefox_pref(&text, "network.trr.mode").and_then(|v| v.parse::<u32>().ok()) {
-            if m == 2 || m == 3 {
-                mode = DnsMode::Own;
-                template = firefox_pref(&text, "network.trr.uri").unwrap_or_default();
+        for f in [file.clone(), file.with_file_name("user.js")] {
+            let text = std::fs::read_to_string(&f).unwrap_or_default();
+            if let Some(m) = firefox_pref(&text, "network.trr.mode").and_then(|v| v.parse::<u32>().ok()) {
+                if m == 2 || m == 3 {
+                    mode = DnsMode::Own;
+                    template = firefox_pref(&text, "network.trr.uri").unwrap_or_default();
+                }
             }
         }
     }
-    let by_policy = std::env::var_os("ProgramFiles")
-        .map(|p| PathBuf::from(p).join(r"Mozilla Firefox\distribution\policies.json"))
+    // Политика может лежать в policies.json рядом с Firefox или в реестре.
+    let by_file = crate::sys::known_folder(crate::sys::Folder::ProgramFiles)
+        .map(|p| p.join(r"Mozilla Firefox\distribution\policies.json"))
         .and_then(|p| std::fs::read_to_string(p).ok())
         .is_some_and(|t| t.contains("DNSOverHTTPS"));
+    let by_registry = [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER]
+        .into_iter()
+        .any(|root| RegKey::predef(root).open_subkey(r"SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS").is_ok());
+    let by_policy = by_file || by_registry;
     Some(BrowserDns {
         name: "Firefox",
         mode,
@@ -291,6 +309,12 @@ fn browser_pids(b: &BrowserDns, procs: &[Proc]) -> Vec<u32> {
         .collect()
 }
 
+/// Процесс с тем же именем, путь к которому прочитать не удалось: чей он, неясно.
+/// Считаем браузер запущенным, но такой процесс не завершаем.
+fn unknown_same_exe(b: &BrowserDns, procs: &[Proc]) -> bool {
+    !b.path_hint.is_empty() && procs.iter().any(|p| p.name.eq_ignore_ascii_case(b.exe) && p.path.is_empty())
+}
+
 /// Закрывает браузер, исправляет его DNS и открывает снова. С одним окном закрытие
 /// штатное, как крестиком. Если окон несколько, закрывать их по одному нельзя:
 /// браузер запомнил бы только последнее. Тогда процессы завершаются сразу, и браузер
@@ -320,20 +344,26 @@ pub fn close_fix_reopen(b: &BrowserDns) -> Result<(), String> {
             sys::terminate(&left);
             std::thread::sleep(std::time::Duration::from_millis(1500));
         }
-        if !browser_pids(b, &processes()).is_empty() {
+        let now = processes();
+        if !browser_pids(b, &now).is_empty() || unknown_same_exe(b, &now) {
             return Err(format!("{} не закрылся. Закройте его вручную и нажмите «Исправить» ещё раз.", b.name));
         }
         // Браузер дописывает настройки при выходе: даём ему закончить.
         std::thread::sleep(std::time::Duration::from_millis(800));
     }
+    if !was_running && unknown_same_exe(b, &procs) {
+        return Err(format!("Похоже, {} запущен. Закройте его полностью и нажмите «Исправить» ещё раз.", b.name));
+    }
     let mut fresh = b.clone();
     fresh.running = false;
-    fix(&fresh)?;
+    let result = fix(&fresh);
+    // Браузер открываем снова и при неудаче: закрыли его мы, без него человек
+    // остался бы с одним сообщением об ошибке.
     if let (true, Some(path)) = (was_running, exe_path) {
         // Открываем от имени пользователя через Проводник, а не с правами администратора.
         sys::open_in_explorer(path);
     }
-    Ok(())
+    result
 }
 
 /// Переводит браузер на DNS Windows. Браузер должен быть закрыт, иначе при выходе
@@ -350,13 +380,20 @@ pub fn fix(b: &BrowserDns) -> Result<(), String> {
             let text = std::fs::read_to_string(local_state).map_err(|e| e.to_string())?;
             let mut json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
             backup(local_state)?;
-            json["dns_over_https"]["mode"] = serde_json::Value::String("automatic".into());
+            // «off», а не «automatic»: в автоматическом режиме браузер сам перевёл бы
+            // страховочные 1.1.1.1 и 8.8.8.8 на DoH Cloudflare и Google.
+            json["dns_over_https"]["mode"] = serde_json::Value::String("off".into());
             json["dns_over_https"]["templates"] = serde_json::Value::String(String::new());
             let text = serde_json::to_string(&json).map_err(|e| e.to_string())?;
             write_replace(local_state, text.as_bytes()).map_err(|e| format!("Не удалось сохранить настройки {}: {e}", b.name))
         }
         Kind::Firefox { prefs } => {
-            for file in prefs {
+            let with_user_js: Vec<PathBuf> = prefs
+                .iter()
+                .flat_map(|p| [p.clone(), p.with_file_name("user.js")])
+                .filter(|p| p.exists())
+                .collect();
+            for file in &with_user_js {
                 let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
                 if !text.contains("\"network.trr.mode\"") {
                     continue;
@@ -434,7 +471,7 @@ mod tests {
             kind: Kind::Chromium { local_state: file.clone() },
         };
         fix(&b).unwrap();
-        assert_eq!(chromium_setting(&file).0, DnsMode::Automatic);
+        assert_eq!(chromium_setting(&file).0, DnsMode::System);
         let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(json["browser"]["enabled_labs_experiments"][0], "x");
         assert!(dir.join("Local State.dnsswitcher-backup").exists());

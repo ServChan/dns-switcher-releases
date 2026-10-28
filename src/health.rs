@@ -525,28 +525,35 @@ fn is_silence(e: &str) -> bool {
 }
 
 /// Запрос любого типа: адреса из ответа (A или AAAA).
+/// Запрос с EDNS0; сервер, который его не понимает (FORMERR), спрашиваем без него.
+fn ask(ip: IpAddr, method: Method, template: &str, name: &str, qtype: u16) -> Result<Vec<u8>, String> {
+    let mut last = Err("нет ответа".to_string());
+    for edns in [true, false] {
+        let id = query_id();
+        let message = build_query_type(id, name, qtype, edns);
+        let reply = match method {
+            Method::Udp => udp_exchange(ip, &message)?,
+            Method::Doh => doh::query(ip, template, &message, TIMEOUT)?,
+        };
+        if edns && reply.len() >= 4 && reply[3] & 0x0f == 1 {
+            continue;
+        }
+        last = validate_reply(&reply, id).map(|_| reply);
+        break;
+    }
+    last
+}
+
 fn resolve_any(ip: IpAddr, method: Method, template: &str, name: &str, qtype: u16) -> Result<Vec<IpAddr>, String> {
-    let id = query_id();
-    let message = build_query_type(id, name, qtype);
-    let reply = match method {
-        Method::Udp => udp_exchange(ip, &message)?,
-        Method::Doh => doh::query(ip, template, &message, TIMEOUT)?,
-    };
-    validate_reply(&reply, id)?;
+    let reply = ask(ip, method, template, name, qtype)?;
     let (v4, v6) = parse_answers(&reply);
     Ok(v4.into_iter().map(IpAddr::V4).chain(v6.into_iter().map(IpAddr::V6)).collect())
 }
 
 /// DNS-запрос типа A к одному адресу сервера: время ответа и адреса из ответа.
 fn resolve(ip: IpAddr, method: Method, template: &str, name: &str) -> Result<(u32, Vec<Ipv4Addr>), String> {
-    let id = query_id();
-    let message = build_query_type(id, name, QTYPE_A);
     let start = Instant::now();
-    let reply = match method {
-        Method::Udp => udp_exchange(ip, &message)?,
-        Method::Doh => doh::query(ip, template, &message, TIMEOUT)?,
-    };
-    validate_reply(&reply, id)?;
+    let reply = ask(ip, method, template, name, QTYPE_A)?;
     let ms = start.elapsed().as_millis().min(u32::MAX as u128) as u32;
     Ok((ms, parse_answers(&reply).0))
 }
@@ -657,10 +664,11 @@ fn query_id() -> u16 {
     ((nanos >> 8) as u16) ^ COUNTER.fetch_add(0x9e37, Ordering::Relaxed)
 }
 
-fn build_query_type(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+fn build_query_type(id: u16, name: &str, qtype: u16, edns: bool) -> Vec<u8> {
     let mut q = Vec::with_capacity(32);
     q.extend_from_slice(&id.to_be_bytes());
-    q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]); // RD, один вопрос
+    // RD, один вопрос и, с EDNS0, одна дополнительная запись.
+    q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, edns as u8]);
     for label in name.split('.') {
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
@@ -668,6 +676,11 @@ fn build_query_type(id: u16, name: &str, qtype: u16) -> Vec<u8> {
     q.push(0); // конец имени
     q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&[0, 1]); // класс IN
+    // EDNS0: ответ до 1232 байт. Без него ответ больше 512 байт (длинная цепочка
+    // CNAME и большой пул прокси) приходит обрезанным и выглядит как «нет адресов».
+    if edns {
+        q.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0]);
+    }
     q
 }
 

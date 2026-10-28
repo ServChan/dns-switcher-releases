@@ -104,7 +104,12 @@ pub fn log(text: &str) {
         return;
     }
     let path = log_path();
-    let _ = std::fs::create_dir_all(data_dir());
+    if !crate::config::data_dir_writable() {
+        return;
+    }
+    // Пишут окно и фоновая защита: запись и обрезка по очереди, иначе обрезка
+    // одного процесса теряла бы строки, дописанные другим.
+    let _lock = LogLock::take();
     let line = format!("{}  {}\n", now_text(), text.replace('\n', " "));
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
@@ -112,6 +117,36 @@ pub fn log(text: &str) {
     if std::fs::metadata(&path).map(|m| m.len() > 96 * 1024).unwrap_or(false) {
         let lines = read_log(LOG_KEEP_LINES);
         let _ = write_atomic(&path, &(lines.join("\n") + "\n"));
+    }
+}
+
+/// Мьютекс журнала на время записи (до секунды ожидания: журнал не стоит зависания).
+struct LogLock(windows_sys::Win32::Foundation::HANDLE);
+
+impl LogLock {
+    fn take() -> Option<Self> {
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        let name: Vec<u16> = "Global\\DnsSwitcherLog".encode_utf16().chain(std::iter::once(0)).collect();
+        let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if h.is_null() {
+            return None;
+        }
+        let r = unsafe { WaitForSingleObject(h, 1000) };
+        if r == 0 || r == 0x80 {
+            Some(LogLock(h))
+        } else {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+            None
+        }
+    }
+}
+
+impl Drop for LogLock {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
     }
 }
 

@@ -58,10 +58,16 @@ try {
         throw 'Ключ в диспетчере учётных данных не совпадает с assets\updater.pub'
     }
     $signature = (& $signer sign $setup).Trim()
+    $sha = (& $signer sha256 $setup).Trim()
+    # Подпись версии вместе с хешем: так в описании выпуска нельзя выдать старый
+    # установщик за новую версию (см. update::release_text).
+    $releaseText = Join-Path $dist 'release.txt'
+    [IO.File]::WriteAllText($releaseText, "dns-switcher-release`n$version`n$($sha.ToLower())`n", (New-Object Text.UTF8Encoding $false))
+    $releaseSignature = (& $signer sign $releaseText).Trim()
+    Remove-Item $releaseText
 } finally {
     Remove-Item Env:DNS_SWITCHER_SIGNING_KEY -ErrorAction SilentlyContinue
 }
-$sha = (& $signer sha256 $setup).Trim()
 
 $manifest = [ordered]@{
     version   = $version
@@ -70,6 +76,7 @@ $manifest = [ordered]@{
     url       = "https://github.com/$Repo/releases/download/$tag/DnsSwitcher-Setup.exe"
     sha256    = $sha
     signature = $signature
+    release_signature = $releaseSignature
 }
 $latest = Join-Path $dist 'latest.json'
 [IO.File]::WriteAllText($latest, ($manifest | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))

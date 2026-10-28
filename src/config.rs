@@ -62,9 +62,17 @@ impl DnsServer {
                 }
             }
         }
+        // Один адрес дважды: netsh не добавит его второй раз, и подключение
+        // осталось бы настроенным наполовину.
+        let mut seen = std::collections::HashSet::new();
+        for ip in self.ipv4.iter().chain(&self.ipv6) {
+            if !seen.insert(ip.parse::<IpAddr>().ok()) {
+                return Err(format!("Адрес «{ip}» указан дважды."));
+            }
+        }
         let doh = self.doh.trim();
-        if !doh.is_empty() && !doh.starts_with("https://") {
-            return Err("Шаблон DoH должен начинаться с https://".into());
+        if !doh.is_empty() && !valid_doh_template(doh) {
+            return Err("Шаблон DoH должен выглядеть как https://dns.example.com/dns-query: без пробелов и {?dns}.".into());
         }
         if self.doh_only && doh.is_empty() {
             return Err("Сервер помечен как «только DoH», но шаблон DoH не указан.".into());
@@ -308,11 +316,103 @@ const DEFAULTS_V1: [(&str, &[&str]); 8] = [
 ];
 
 /// Папка настроек: %APPDATA%\DnsSwitcher.
+/// Настройки и журнал. Пишут их процессы с правами администратора, поэтому папка
+/// лежит в ProgramData и закрыта для записи обычным пользователям: иначе через
+/// подменённую папку (ссылку) или правку config.json можно было бы заставить
+/// программу писать куда угодно или ставить свои DNS-серверы на весь компьютер.
+/// Отладочная сборка и тесты работают с прежней папкой пользователя.
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("DnsSwitcher")
+    if cfg!(debug_assertions) || cfg!(test) {
+        return legacy_data_dir();
+    }
+    if let Some(dir) = DATA_DIR_OVERRIDE.get() {
+        return dir.clone();
+    }
+    program_data_dir()
+}
+
+fn program_data_dir() -> PathBuf {
+    crate::sys::known_folder(crate::sys::Folder::ProgramData)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("DnsSwitcher")
+}
+
+/// Запасная папка данных на этот запуск: на месте обычной лежит ссылка, которую
+/// не удалось убрать, и писать через неё нельзя.
+static DATA_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Можно ли писать в папку данных, создав её при необходимости. Без прав
+/// администратора папку не создаём: её владельцем стал бы обычный пользователь,
+/// и следующий запуск с правами убрал бы её в сторону вместе с настройками.
+pub fn data_dir_writable() -> bool {
+    let dir = data_dir();
+    if cfg!(debug_assertions) || cfg!(test) || dir.exists() {
+        return std::fs::create_dir_all(&dir).is_ok();
+    }
+    crate::elevate::is_admin() && std::fs::create_dir_all(&dir).is_ok()
+}
+
+/// Где настройки лежали до версии 1.0.2: %APPDATA%\DnsSwitcher.
+pub fn legacy_data_dir() -> PathBuf {
+    crate::sys::known_folder(crate::sys::Folder::RoamingAppData).unwrap_or_else(|| PathBuf::from(".")).join("DnsSwitcher")
+}
+
+/// Готовит папку данных (только с правами администратора): чужую папку или ссылку
+/// на её месте убирает в сторону, закрывает запись для обычных пользователей и
+/// переносит настройки из прежней папки.
+pub fn prepare_data_dir() {
+    if cfg!(debug_assertions) || !crate::elevate::is_admin() {
+        return;
+    }
+    let mut dir = program_data_dir();
+    let untrusted = |d: &std::path::Path| crate::sys::is_reparse_point(d) || !crate::sys::owned_by_admins(d);
+    if std::fs::symlink_metadata(&dir).is_ok() && untrusted(&dir) {
+        let away = dir.with_file_name(format!("DnsSwitcher.untrusted-{}", crate::sys::random_suffix()));
+        let moved = std::fs::rename(&dir, &away).is_ok() || (crate::sys::is_reparse_point(&dir) && std::fs::remove_dir(&dir).is_ok());
+        if !moved {
+            // Убрать не вышло (её держат открытой): на этот запуск своя новая папка.
+            dir = dir.with_file_name(format!("DnsSwitcher.{}", crate::sys::random_suffix()));
+            let _ = DATA_DIR_OVERRIDE.set(dir.clone());
+            crate::state::log("Папка настроек занята чужой ссылкой, настройки этого запуска хранятся отдельно.");
+        }
+    }
+    let fresh = !dir.exists();
+    if std::fs::create_dir_all(&dir).is_err() || crate::sys::is_reparse_point(&dir) {
+        return;
+    }
+    let path = dir.to_string_lossy().to_string();
+    // Владелец — группа «Администраторы», а не учётная запись, от которой создана
+    // папка (так бывает при выключенном UAC): иначе следующий запуск счёл бы её чужой.
+    let _ = crate::apply::run_tool("icacls", &[&path, "/setowner", "*S-1-5-32-544", "/L"]);
+    let _ = crate::apply::run_tool(
+        "icacls",
+        &[&path, "/inheritance:r", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX", "/L"],
+    );
+    if fresh {
+        migrate_legacy_data();
+    }
+}
+
+/// Переносит настройки и состояние из %APPDATA%. Файлы оттуда мог подменить кто
+/// угодно, поэтому копируется не файл, а разобранные из него настройки.
+fn migrate_legacy_data() {
+    let old = legacy_data_dir();
+    if crate::sys::is_reparse_point(&old) {
+        return;
+    }
+    let read = |name: &str| {
+        let p = old.join(name);
+        if crate::sys::is_reparse_point(&p) { None } else { std::fs::read_to_string(p).ok() }
+    };
+    if let Some(cfg) = read("config.json").and_then(|t| serde_json::from_str::<Config>(&t).ok()) {
+        let _ = cfg.save();
+    }
+    if let Some(st) = read("state.json").and_then(|t| serde_json::from_str::<crate::state::RuntimeState>(&t).ok()) {
+        let _ = st.save();
+    }
+    if old.exists() {
+        crate::state::log(&format!("Настройки перенесены из {} в {}.", old.display(), data_dir().display()));
+    }
 }
 
 fn config_path() -> PathBuf {
@@ -328,7 +428,13 @@ pub fn config_stamp() -> Option<std::time::SystemTime> {
 /// Записывает файл целиком через временный, чтобы второй процесс не прочитал половину.
 pub fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("Не удалось создать папку настроек: {e}"))?;
+        if dir == data_dir() {
+            if !data_dir_writable() {
+                return Err("Не удалось сохранить настройки: нужны права администратора.".into());
+            }
+        } else {
+            std::fs::create_dir_all(dir).map_err(|e| format!("Не удалось создать папку настроек: {e}"))?;
+        }
     }
     // Своё имя у каждой записи: окно и фоновая защита пишут одновременно.
     let tmp = path.with_extension(format!("{}.tmp", crate::sys::random_suffix()));
@@ -343,20 +449,45 @@ pub fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
 impl Config {
     pub fn load() -> Self {
         let path = config_path();
-        let mut cfg: Self = match std::fs::read_to_string(&path) {
+        // Файл занят (антивирус, запись другим процессом): повторяем, а не подставляем
+        // стандартные настройки, которые окно потом записало бы поверх списка.
+        let mut read = std::fs::read_to_string(&path);
+        for _ in 0..10 {
+            match &read {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    read = std::fs::read_to_string(&path);
+                }
+                _ => break,
+            }
+        }
+        let mut cfg: Self = match read {
             Err(_) => Self::default(),
             Ok(text) => match serde_json::from_str(&text) {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     // Испорченный файл не затираем молча: свой список серверов
                     // можно будет восстановить из копии.
-                    let broken = path.with_extension("broken.json");
-                    if !broken.exists() {
-                        let _ = std::fs::copy(&path, &broken);
-                        crate::state::log(&format!(
-                            "Файл настроек повреждён ({e}), загружены стандартные. Копия: {}.",
-                            broken.display()
-                        ));
+                    // Копия одна на каждое содержимое: настройки читаются каждые
+                    // несколько секунд, и без этого копий набралось бы тысячи.
+                    static SAVED: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+                    let hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        text.hash(&mut h);
+                        h.finish()
+                    };
+                    let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+                    if *saved != Some(hash) {
+                        *saved = Some(hash);
+                        let broken = path.with_extension(format!("broken-{hash:016x}.json"));
+                        if !broken.exists() {
+                            let _ = std::fs::copy(&path, &broken);
+                            crate::state::log(&format!(
+                                "Файл настроек повреждён ({e}), загружены стандартные. Копия: {}.",
+                                broken.display()
+                            ));
+                        }
                     }
                     Self::default()
                 }
@@ -422,7 +553,21 @@ impl Config {
             for s in &mut self.servers {
                 if let Some(f) = fresh.iter().find(|f| f.name == s.name) {
                     s.builtin = true;
-                    s.edited = s.ipv4 != f.ipv4 || s.doh != f.doh;
+                    // Примечания и пометки старых версий отличались от нынешних сами
+                    // по себе: правкой считаем только адреса и шаблон DoH.
+                    s.edited = s.ipv4 != f.ipv4 || s.ipv6 != f.ipv6 || s.doh != f.doh;
+                }
+            }
+            // Стандартные серверы, которые у человека были, а теперь их нет, он удалил
+            // сам: обновление подписанного списка не должно их возвращать.
+            let had: Vec<&str> = if was < 2 {
+                DEFAULTS_V1.iter().map(|(n, _)| *n).chain(["GeoHide EU", "GeoHide US"]).collect()
+            } else {
+                DEFAULTS_V2.iter().map(|(n, _)| *n).collect()
+            };
+            for f in &fresh {
+                if had.contains(&f.name.as_str()) && self.find(&f.name).is_none() && !self.hidden_builtin.contains(&f.name) {
+                    self.hidden_builtin.push(f.name.clone());
                 }
             }
             // Список уже был: человек пользовался программой и знает её подробный вид.
@@ -470,7 +615,8 @@ impl Config {
         }
         let mut changes = Vec::new();
         for r in &list.servers {
-            match self.servers.iter_mut().find(|s| s.name == r.name) {
+            // Без учёта регистра: свой «comss dns» не должен получить соседа «Comss DNS».
+            match self.servers.iter_mut().find(|s| s.name.to_lowercase() == r.name.to_lowercase()) {
                 Some(s) if s.builtin && !s.edited => {
                     let same = s.ipv4 == r.ipv4 && s.ipv6 == r.ipv6 && s.doh == r.doh && s.doh_only == r.doh_only;
                     if !same {
@@ -496,9 +642,9 @@ impl Config {
                 }
             }
         }
-        let names: Vec<&str> = list.servers.iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<String> = list.servers.iter().map(|s| s.name.to_lowercase()).collect();
         self.servers.retain(|s| {
-            let keep_it = !s.builtin || s.edited || names.contains(&s.name.as_str()) || keep.contains(&s.name);
+            let keep_it = !s.builtin || s.edited || names.contains(&s.name.to_lowercase()) || keep.contains(&s.name);
             if !keep_it {
                 changes.push(format!("убран «{}»", s.name));
             }
@@ -507,6 +653,34 @@ impl Config {
         self.remote_list_version = list.version;
         changes
     }
+}
+
+/// Шаблон DoH: https://, имя сервера и путь, без пробелов и шаблонных скобок.
+fn valid_doh_template(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix("https://") else { return false };
+    let host = rest.split(['/', '?']).next().unwrap_or("");
+    let host = host.rsplit_once(':').map_or(host, |(h, port)| if port.chars().all(|c| c.is_ascii_digit()) { h } else { host });
+    !t.chars().any(|c| c.is_whitespace() || c == '{' || c == '}') && valid_hostname(host)
+}
+
+/// Имя хоста: метки из букв, цифр и дефисов, хотя бы одна точка.
+fn valid_hostname(h: &str) -> bool {
+    h.len() <= 253
+        && h.contains('.')
+        && h.split('.').all(|l| {
+            !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+}
+
+/// Адрес проверяемого сервиса из того, что ввёл человек: убирает схему, путь и
+/// порт («https://claude.ai/chat» → «claude.ai»). None, если это не имя сайта.
+pub fn probe_domain(text: &str) -> Option<String> {
+    let t = text.trim();
+    let t = t.split_once("://").map_or(t, |(_, rest)| rest);
+    let host = t.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    let host = host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+    valid_hostname(&host).then_some(host)
 }
 
 /// Разбирает список адресов, введённых через запятую, пробел или перевод строки.
@@ -585,6 +759,28 @@ mod tests {
         assert!(fresh < first_regular, "новый сервер для ИИ встаёт в свою группу");
         assert!(!changes.is_empty());
         assert!(cfg.apply_server_list(&list, &[]).is_empty(), "та же версия второй раз не применяется");
+    }
+
+    #[test]
+    fn probe_domains_are_hostnames() {
+        assert_eq!(probe_domain("https://claude.ai/chat").as_deref(), Some("claude.ai"));
+        assert_eq!(probe_domain("claude.ai:443").as_deref(), Some("claude.ai"));
+        assert_eq!(probe_domain(" Gemini.Google.com ").as_deref(), Some("gemini.google.com"));
+        assert_eq!(probe_domain("localhost"), None);
+        assert_eq!(probe_domain("a b.com"), None);
+    }
+
+    #[test]
+    fn server_validation_rejects_duplicates_and_bad_templates() {
+        let mut s = server("X", &["1.1.1.1", "1.1.1.1"], &[], "", false, "");
+        assert!(s.validate().is_err());
+        s.ipv4 = vec!["1.1.1.1".into()];
+        for bad in ["https://", "https://a b/q", "https://x.example/dns-query{?dns}", "http://x.example/q"] {
+            s.doh = bad.into();
+            assert!(s.validate().is_err(), "{bad}");
+        }
+        s.doh = "https://dns.example.com:8443/dns-query".into();
+        assert!(s.validate().is_ok());
     }
 
     #[test]

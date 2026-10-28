@@ -27,12 +27,19 @@ fn main() -> eframe::Result {
     let has = |flag: &str| args.iter().any(|a| a == flag);
     // Фоновая защита из Планировщика заданий: без окна, только слежение.
     if has("--watch") {
+        // Без прав администратора слежение заняло бы место настоящего, но не смогло
+        // бы менять DNS: защита молча перестала бы работать.
+        if !elevate::is_admin() {
+            return Ok(());
+        }
+        config::prepare_data_dir();
         monitor::run_loop(Arc::new(AtomicBool::new(false)), false);
         return Ok(());
     }
     if !elevate::ensure_admin(&args) {
         return Ok(()); // работу продолжает копия с правами администратора
     }
+    config::prepare_data_dir();
     // Тихое обновление из скачанного установщика: без окна мастера.
     if has("--update") {
         if let Err(e) = install::silent_update() {
@@ -55,7 +62,13 @@ fn main() -> eframe::Result {
     // Второе окно программы не открываем, а выводим вперёд первое.
     // Отладочной сборке правило не мешает: её окно открывается рядом с установленным.
     let gui_lock = match wizard {
-        Some(_) => None,
+        Some(_) => match elevate::setup_lock() {
+            Some(lock) => Some(lock),
+            None => {
+                elevate::message_box("Установщик уже открыт. Завершите работу с ним.");
+                return Ok(());
+            }
+        },
         None if cfg!(debug_assertions) => None,
         None => match elevate::single_instance(has("--wait-gui")) {
             Some(lock) => Some(lock),
@@ -85,7 +98,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let root = match wizard {
-                Some(mode) => Root::Wizard(installer::Wizard::new(&cc.egui_ctx, mode)),
+                Some(mode) => Root::Wizard { wizard: installer::Wizard::new(&cc.egui_ctx, mode), _lock: gui_lock },
                 None => Root::Main { app: ui::DnsApp::new(&cc.egui_ctx), _lock: gui_lock },
             };
             Ok(Box::new(root))
@@ -96,7 +109,7 @@ fn main() -> eframe::Result {
 const MAIN_SIZE: [f32; 2] = [980.0, 780.0];
 
 enum Root {
-    Wizard(installer::Wizard),
+    Wizard { wizard: installer::Wizard, _lock: Option<elevate::GuiLock> },
     Main { app: ui::DnsApp, _lock: Option<elevate::GuiLock> },
 }
 
@@ -104,13 +117,17 @@ impl eframe::App for Root {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         match self {
             Root::Main { app, .. } => app.ui(ui),
-            Root::Wizard(wizard) => {
+            Root::Wizard { wizard, .. } => {
                 if let installer::Choice::RunPortable = wizard.ui(ui) {
                     let ctx = ui.ctx().clone();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(elevate::WINDOW_TITLE.into()));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(MAIN_SIZE.into()));
-                    *self = Root::Main { app: ui::DnsApp::new(&ctx), _lock: elevate::single_instance(false) };
+                    // Окно программы уже открыто: выводим его вперёд, а мастер закрываем.
+                    match elevate::single_instance(false) {
+                        Some(lock) => *self = Root::Main { app: ui::DnsApp::new(&ctx), _lock: Some(lock) },
+                        None => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    }
                 }
             }
         }

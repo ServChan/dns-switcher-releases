@@ -18,7 +18,6 @@ use eframe::egui::{
     RichText, Role, Sense, Stroke, StrokeKind, TextStyle, UiBuilder, Vec2, WidgetInfo, pos2,
 };
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -39,8 +38,7 @@ enum Done {
 }
 
 enum Msg {
-    /// `adapters`: GUID подключений, к которым применяли (выбор мог поменяться за это время).
-    Done { done: Done, outcomes: Vec<Outcome>, adapters: Vec<String> },
+    Done { done: Done, outcomes: Vec<Outcome> },
     Health { name: String, health: Health },
     Task(Result<bool, String>),
     Browsers(Vec<browsers::BrowserDns>),
@@ -99,7 +97,11 @@ enum Confirm {
 
 #[derive(Default)]
 struct Editor {
-    index: Option<usize>,
+    /// Имя редактируемого сервера (None — новый). По имени, а не по номеру строки:
+    /// пока окно открыто, обновление списка может сдвинуть строки.
+    original: Option<String>,
+    /// Первый кадр: Enter, которым нажали кнопку «Изменить», не сохраняет форму.
+    skip_enter: bool,
     name: String,
     ipv4: String,
     ipv6: String,
@@ -114,12 +116,13 @@ struct Editor {
 
 impl Editor {
     fn new_server() -> Self {
-        Self { ai_bypass: true, ..Default::default() }
+        Self { ai_bypass: true, skip_enter: true, ..Default::default() }
     }
 
-    fn from_server(index: usize, s: &DnsServer) -> Self {
+    fn from_server(s: &DnsServer) -> Self {
         Self {
-            index: Some(index),
+            original: Some(s.name.clone()),
+            skip_enter: true,
             name: s.name.clone(),
             ipv4: s.ipv4.join(", "),
             ipv6: s.ipv6.join(", "),
@@ -172,6 +175,35 @@ enum RowAction {
     Move(usize, bool),
 }
 
+/// Запоминает выбор пользователя (за ним следит защита от сбоев). Вызывается под
+/// замком смены DNS сразу после неё; ошибка записи добавляется к замечаниям.
+fn record_choice(done: &Done, outcomes: &mut [Outcome], adapters: Vec<String>) {
+    let names: Vec<String> = outcomes.iter().filter(|o| o.result.is_ok()).map(|o| o.adapter.clone()).collect();
+    if names.is_empty() {
+        return;
+    }
+    let mut st = RuntimeState::load();
+    match done {
+        Done::Applied(name) => {
+            st.preferred = Some(name.clone());
+            st.active = Some(name.clone());
+            st.adapters = adapters;
+            state::log(&format!("Вручную применён «{name}» для: {}.", names.join(", ")));
+        }
+        Done::Reset => {
+            st.preferred = None;
+            st.active = None;
+            state::log(&format!("DNS сброшен на автоматический для: {}.", names.join(", ")));
+        }
+    }
+    st.on_dhcp_fallback = false;
+    if let Err(e) = st.save() {
+        if let Some(Ok(w)) = outcomes.iter_mut().find(|o| o.result.is_ok()).map(|o| &mut o.result) {
+            w.push(e);
+        }
+    }
+}
+
 pub struct DnsApp {
     config: Config,
     runtime: RuntimeState,
@@ -196,6 +228,8 @@ pub struct DnsApp {
     new_probe: (String, String),
     /// Ход и итог исправления браузеров: показывается прямо в их плашке.
     browser_note: HashMap<String, (bool, String)>,
+    /// Браузеры, которые сейчас исправляются.
+    fixing_browsers: HashSet<String>,
     /// Контекст окна: фоновые действия просят по нему перерисовку.
     ctx: egui::Context,
     /// Время файла настроек, которое окно уже видело.
@@ -250,6 +284,7 @@ impl DnsApp {
             action_epoch: 0,
             new_probe: Default::default(),
             browser_note: HashMap::new(),
+            fixing_browsers: HashSet::new(),
             config_stamp: crate::config::config_stamp(),
             ctx: ctx.clone(),
             status: None,
@@ -360,11 +395,7 @@ impl DnsApp {
 
     /// Индекс сервера из списка, который сейчас стоит первым DNS на адаптере.
     fn server_in_use(&self, adapter: &Adapter) -> Option<usize> {
-        // Основной адрес: первый IPv4, IPv6 Windows может перечислить раньше.
-        let first = adapter.dns.iter().find(|ip| ip.is_ipv4()).or_else(|| adapter.dns.first())?;
-        self.config.servers.iter().position(|s| {
-            s.all_ips().any(|ip| ip.parse::<IpAddr>().ok().as_ref() == Some(first))
-        })
+        self.config.servers.iter().position(|s| monitor::adapter_uses(adapter, s))
     }
 
     fn servers_in_use(&self) -> HashSet<usize> {
@@ -486,8 +517,17 @@ impl DnsApp {
         });
         self.status = None;
         std::thread::spawn(move || {
-            let outcomes = apply::run(&action, &adapters);
-            let _ = tx.send(Msg::Done { done, outcomes, adapters: guids });
+            // Выбор записывается под тем же замком, что и смена DNS: защита от сбоев
+            // не может между ними поставить свой резервный сервер поверх выбора.
+            let outcomes = match apply::lock() {
+                Ok(lock) => {
+                    let mut outcomes = apply::run_locked(&lock, &action, &adapters);
+                    record_choice(&done, &mut outcomes, guids);
+                    outcomes
+                }
+                Err(e) => adapters.iter().map(|a| Outcome { adapter: a.name.clone(), result: Err(e.clone()) }).collect(),
+            };
+            let _ = tx.send(Msg::Done { done, outcomes });
             ctx.request_repaint();
         });
     }
@@ -547,7 +587,10 @@ impl DnsApp {
                 }
                 Msg::E2e(e) => self.e2e = e,
                 Msg::Browsers(list) => self.browsers = list,
-                Msg::BrowserFixed(name, result) => match result {
+                Msg::BrowserFixed(name, result) => match {
+                    self.fixing_browsers.remove(&name);
+                    result
+                } {
                     Ok(()) => {
                         state::log(&format!("{name} переключён на DNS Windows."));
                         self.browser_note.insert(name.clone(), (true, "Исправлено: браузер пользуется DNS Windows.".into()));
@@ -623,9 +666,9 @@ impl DnsApp {
                     }
                     Err(e) => self.set_status(StatusKind::Error, format!("Не удалось изменить IPv6 на {name}: {e}")),
                 },
-                Msg::Done { done, outcomes, adapters } => {
+                Msg::Done { done, outcomes } => {
                     self.busy = None;
-                    self.finish_action(done, outcomes, adapters);
+                    self.finish_action(done, outcomes);
                     self.refresh_adapters();
                 }
                 Msg::Task(result) => {
@@ -650,8 +693,7 @@ impl DnsApp {
         }
     }
 
-    fn finish_action(&mut self, done: Done, outcomes: Vec<Outcome>, adapters: Vec<String>) {
-        let names: Vec<&str> = outcomes.iter().map(|o| o.adapter.as_str()).collect();
+    fn finish_action(&mut self, done: Done, outcomes: Vec<Outcome>) {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
         for o in &outcomes {
@@ -660,40 +702,28 @@ impl DnsApp {
                 Err(e) => errors.push(format!("{}: {e}", o.adapter)),
             }
         }
-        let any_ok = outcomes.iter().any(|o| o.result.is_ok());
-        if any_ok {
-            // Запоминаем выбор: за ним следит защита от сбоев.
-            let mut st = RuntimeState::load();
-            match &done {
-                Done::Applied(name) => {
-                    st.preferred = Some(name.clone());
-                    st.active = Some(name.clone());
-                    st.adapters = adapters;
-                    state::log(&format!("Вручную применён «{name}» для: {}.", names.join(", ")));
-                }
-                Done::Reset => {
-                    st.preferred = None;
-                    st.active = None;
-                    state::log(&format!("DNS сброшен на автоматический для: {}.", names.join(", ")));
-                }
-            }
-            st.on_dhcp_fallback = false;
-            if let Err(e) = st.save() {
-                warnings.push(e);
-            }
-            self.runtime = st;
+        let ok_names: Vec<&str> = outcomes.iter().filter(|o| o.result.is_ok()).map(|o| o.adapter.as_str()).collect();
+        if !ok_names.is_empty() {
+            self.runtime = RuntimeState::load();
         }
 
         let what = match &done {
             Done::Applied(name) => format!("«{name}» применён"),
             Done::Reset => "DNS сброшен на автоматический".to_string(),
         };
-        if !errors.is_empty() {
+        if !errors.is_empty() && !ok_names.is_empty() {
+            // Часть подключений получилась: защита уже следит за ними, это надо сказать.
+            let mut text = format!("{what} для: {}. Не получилось:\n{}", ok_names.join(", "), errors.join("\n"));
+            if !warnings.is_empty() {
+                text.push_str(&format!("\nЗамечания:\n{}", warnings.join("\n")));
+            }
+            self.set_status(StatusKind::Warning, text);
+        } else if !errors.is_empty() {
             self.set_status(StatusKind::Error, errors.join("\n"));
         } else if !warnings.is_empty() {
             self.set_status(StatusKind::Warning, format!("{what}, но есть замечания.\n{}", warnings.join("\n")));
         } else {
-            self.set_status(StatusKind::Success, format!("{what} для: {}. Кэш DNS очищен.", names.join(", ")));
+            self.set_status(StatusKind::Success, format!("{what} для: {}. Кэш DNS очищен.", ok_names.join(", ")));
         }
         self.log_tail = state::read_log(200);
     }
@@ -969,7 +999,7 @@ impl DnsApp {
 
         match action {
             Some(RowAction::Apply(i)) => self.apply_server(&ctx, i),
-            Some(RowAction::Edit(i)) => self.editor = Some(Editor::from_server(i, &self.config.servers[i])),
+            Some(RowAction::Edit(i)) => self.editor = self.config.servers.get(i).map(Editor::from_server),
             Some(RowAction::Delete(i)) => self.ask_delete(i),
             Some(RowAction::Move(i, down)) => self.move_server(i, down),
             None => {}
@@ -1220,7 +1250,7 @@ impl DnsApp {
 
             match action {
                 Some(RowAction::Apply(i)) => self.apply_server(&ctx, i),
-                Some(RowAction::Edit(i)) => self.editor = Some(Editor::from_server(i, &self.config.servers[i])),
+                Some(RowAction::Edit(i)) => self.editor = self.config.servers.get(i).map(Editor::from_server),
                 Some(RowAction::Delete(i)) => self.ask_delete(i),
                 Some(RowAction::Move(i, down)) => self.move_server(i, down),
                 None => {}
@@ -1333,7 +1363,7 @@ impl DnsApp {
         modal(ctx, "server-editor").show(ctx, |ui| {
             let p = palette(ui);
             ui.set_width(500.0);
-            ui.heading(if ed.index.is_some() { "Изменить сервер" } else { "Новый сервер" });
+            ui.heading(if ed.original.is_some() { "Изменить сервер" } else { "Новый сервер" });
             ui.add_space(14.0);
             egui::Grid::new("editor-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
                 field(ui, "Название", &mut ed.name, "Например, Мой DNS");
@@ -1350,8 +1380,10 @@ impl DnsApp {
                 ui.label(RichText::new(err).color(p.danger_text));
             }
             ui.add_space(18.0);
+            let enter = !ed.skip_enter && ui.input(|i| i.key_pressed(Key::Enter));
+            ed.skip_enter = false;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if accent_button(ui, p, "Сохранить", false, true, false).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                if accent_button(ui, p, "Сохранить", false, true, false).clicked() || enter {
                     result = DialogResult::Accept;
                 }
                 if secondary_button(ui, "Отмена").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -1365,13 +1397,16 @@ impl DnsApp {
             DialogResult::Cancel => {}
             DialogResult::Accept => {
                 let server = ed.to_server();
+                let index = ed.original.as_ref().map(|n| self.config.servers.iter().position(|s| &s.name == n));
                 let duplicate = self
                     .config
                     .servers
                     .iter()
                     .enumerate()
-                    .any(|(i, s)| Some(i) != ed.index && s.name.to_lowercase() == server.name.to_lowercase());
-                let check = if duplicate {
+                    .any(|(i, s)| index.flatten() != Some(i) && s.name.to_lowercase() == server.name.to_lowercase());
+                let check = if index == Some(None) {
+                    Err("Этот сервер убрали из списка, пока окно было открыто. Нажмите «Отмена» и добавьте его заново.".to_string())
+                } else if duplicate {
                     Err("Сервер с таким названием уже есть. Выберите другое название.".to_string())
                 } else {
                     server.validate()
@@ -1383,7 +1418,7 @@ impl DnsApp {
                     }
                     Ok(()) => {
                         let mut server = server;
-                        let index = match ed.index {
+                        let index = match index.flatten() {
                             Some(i) => {
                                 // Сохранили без изменений: стандартный сервер остаётся
                                 // нетронутым и дальше получает адреса из списка.
@@ -1530,7 +1565,12 @@ impl DnsApp {
                     // применится заново при следующей проверке.
                     self.config.remote_list_version = 0;
                     self.selected = None;
-                    self.save_config();
+                    // Сохраняем как есть: слияние с диском вернуло бы версию списка
+                    // и убрало бы только что восстановленные серверы.
+                    if let Err(e) = self.config.save() {
+                        self.set_status(StatusKind::Error, e);
+                    }
+                    self.config_stamp = crate::config::config_stamp();
                     self.start_sweep(ctx);
                     self.set_status(StatusKind::Success, "Стандартный список восстановлен.");
                 }
@@ -1593,11 +1633,13 @@ impl DnsApp {
         let cfg = self.config.clone();
         let tx = self.tx.clone();
         let ctx = ctx.clone();
-        for s in cfg.servers.iter().filter(|s| s.ai_bypass) {
+        // Сервер «только DoH» при выключенном DoH не поставится: его не предлагаем.
+        let pickable = |s: &&DnsServer| s.ai_bypass && (!s.doh_only || cfg.use_doh);
+        for s in cfg.servers.iter().filter(pickable) {
             self.health.insert(s.name.clone(), HealthView::Running);
         }
+        let ai: Vec<DnsServer> = cfg.servers.iter().filter(pickable).cloned().collect();
         std::thread::spawn(move || {
-            let ai: Vec<DnsServer> = cfg.servers.iter().filter(|s| s.ai_bypass).cloned().collect();
             let checked = monitor::check_all(&cfg, &ai);
             let _ = tx.send(Msg::AutoPicked(checked, epoch));
             ctx.request_repaint();
@@ -1663,6 +1705,11 @@ impl DnsApp {
     }
 
     fn fix_browser(&mut self, ctx: &egui::Context, b: &browsers::BrowserDns) {
+        // Второе нажатие, пока идёт первое, открыло бы браузер дважды и затёрло бы
+        // резервную копию его настроек уже исправленным файлом.
+        if !self.fixing_browsers.insert(b.name.to_string()) {
+            return;
+        }
         let note = if b.running { format!("Закрываю {}, исправляю и открываю снова…", b.name) } else { "Исправляю…".to_string() };
         self.browser_note.insert(b.name.to_string(), (true, note));
         let (tx, ctx, b) = (self.tx.clone(), ctx.clone(), b.clone());
@@ -1692,7 +1739,7 @@ impl DnsApp {
         self.update_busy = Some(format!("Скачиваю версию {}…", m.version));
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(Msg::UpdateDownloaded(update::download_app(&m)));
+            let _ = tx.send(Msg::UpdateDownloaded(update::download_app()));
             ctx.request_repaint();
         });
     }
@@ -1789,16 +1836,17 @@ impl DnsApp {
         for b in self.bypassing_browsers().into_iter().cloned().collect::<Vec<_>>() {
             banner(ui, &mut |ui: &mut egui::Ui| {
                 ui.label(RichText::new(format!("{} обходит DNS Windows:", b.name)).family(semibold()).color(p.warn_text));
-                ui.label("у него свой защищённый DNS, поэтому обход в нём не работает.");
+                ui.label(b.bypass_reason());
                 if b.can_fix() {
                     let label = if b.running { format!("Закрыть {} и исправить", b.name) } else { "Исправить".to_string() };
                     let hover = if b.running {
-                        "Браузер закроется как обычно, переключится на DNS Windows и откроется снова. Вкладки сохранятся, \
-                         если в нём включено «Продолжить работу с того же места»."
+                        "Браузер закроется, переключится на DNS Windows и откроется снова. Если окон несколько, он \
+                         закрывается сразу, и при запуске он может предложить восстановить вкладки."
                     } else {
                         "Браузер начнёт пользоваться DNS Windows."
                     };
-                    if ui.button(label).on_hover_text(hover).clicked() {
+                    let busy = self.fixing_browsers.contains(b.name);
+                    if ui.add_enabled(!busy, egui::Button::new(label)).on_hover_text(hover).clicked() {
                         self.fix_browser(&ctx, &b);
                     }
                     if let Some((ok, note)) = self.browser_note.get(b.name) {

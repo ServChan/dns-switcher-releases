@@ -208,11 +208,19 @@ impl Wizard {
 
     fn poll(&mut self) {
         if let Some(rx) = &self.worker {
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    WorkerMsg::Started(i) => self.states[i] = StepState::Running,
-                    WorkerMsg::Finished(i, Ok(())) => self.states[i] = StepState::Done,
-                    WorkerMsg::Finished(i, Err(e)) => self.states[i] = StepState::Failed(e),
+            loop {
+                match rx.try_recv() {
+                    Ok(WorkerMsg::Started(i)) => self.states[i] = StepState::Running,
+                    Ok(WorkerMsg::Finished(i, Ok(()))) => self.states[i] = StepState::Done,
+                    Ok(WorkerMsg::Finished(i, Err(e))) => self.states[i] = StepState::Failed(e),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    // Поток шагов упал: показываем сбой, иначе окно ждало бы вечно.
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if let Some(s) = self.states.iter_mut().find(|s| **s != StepState::Done) {
+                            *s = StepState::Failed("внутренняя ошибка установщика".into());
+                        }
+                        break;
+                    }
                 }
             }
             if self.states.iter().all(|s| *s == StepState::Done) {
@@ -257,6 +265,11 @@ impl Wizard {
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Choice {
         self.poll();
         let ctx = ui.ctx().clone();
+        // Пока идут шаги, окно не закрывается: прерванная установка оставила бы
+        // программу наполовину (файл скопирован, а записи в «Приложениях» нет).
+        if self.worker.is_some() && self.failed_index().is_none() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         let p = palette(ui);
         let mut choice = Choice::Stay;
 
@@ -407,6 +420,8 @@ impl Wizard {
             hint(ui, p, "При обновлении папка не меняется.");
         } else if self.dir_text.trim().is_empty() {
             ui.label(RichText::new("Укажите папку установки.").small().color(p.danger_text));
+        } else if !dir.is_absolute() {
+            ui.label(RichText::new(r"Укажите полный путь, например C:\Program Files\DnsSwitcher.").small().color(p.danger_text));
         } else if !install::is_protected_dir(&dir) {
             ui.add(
                 egui::Label::new(
@@ -533,7 +548,7 @@ impl Wizard {
                 if self.un.remove_settings {
                     "Удалены программа, задания, ярлыки и настройки."
                 } else {
-                    "Список серверов и настройки остались в %APPDATA%\\DnsSwitcher."
+                    "Список серверов и настройки остались в %ProgramData%\\DnsSwitcher."
                 },
             ),
         };
@@ -603,7 +618,7 @@ impl Wizard {
                     }
                 }
                 Page::Options => {
-                    let ok = !self.dir_text.trim().is_empty() && self.is_admin;
+                    let ok = !self.dir_text.trim().is_empty() && PathBuf::from(self.dir_text.trim()).is_absolute() && self.is_admin;
                     let label = if self.updating() { "Обновить" } else { "Установить" };
                     let resp = primary(ui, p, label, ok);
                     let resp = if self.is_admin { resp } else { resp.on_disabled_hover_text("Нужны права администратора.") };

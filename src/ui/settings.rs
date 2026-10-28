@@ -184,7 +184,7 @@ impl DnsApp {
             ui,
             p,
             "Провайдер не видит и не подменяет запросы. Нужна Windows 11. Для серверов «только DoH» шифрование \
-             обязательно.",
+             обязательно. Действует со следующего «Применить» или переключения.",
         );
 
         ui.add_space(16.0);
@@ -217,8 +217,9 @@ impl DnsApp {
             ui.add(egui::TextEdit::singleline(&mut self.new_probe.0).hint_text("Название").desired_width(140.0));
             ui.add(egui::TextEdit::singleline(&mut self.new_probe.1).hint_text("адрес, например claude.ai").desired_width(220.0));
             let name = self.new_probe.0.trim().to_string();
-            let domain = self.new_probe.1.trim().trim_start_matches("https://").trim_end_matches('/').to_string();
-            let valid = !name.is_empty() && domain.contains('.') && !domain.contains(' ');
+            let domain = crate::config::probe_domain(&self.new_probe.1);
+            let valid = !name.is_empty() && domain.is_some();
+            let domain = domain.unwrap_or_default();
             if ui.add_enabled(valid, egui::Button::new("Добавить")).clicked() {
                 self.config.probes.push(crate::config::Probe { name, domain, enabled: true });
                 self.new_probe = Default::default();
@@ -284,7 +285,7 @@ impl DnsApp {
                 ui.label(RichText::new(b.name).family(semibold()));
                 let text = match b.mode {
                     browsers::DnsMode::Own => format!("свой DNS: {}", if b.template.is_empty() { "задан" } else { &b.template }),
-                    browsers::DnsMode::Automatic => "DNS Windows (автоматически)".into(),
+                    browsers::DnsMode::Automatic => "«автоматически»: может сам перейти на Cloudflare или Google".into(),
                     browsers::DnsMode::System => "DNS Windows".into(),
                 };
                 ui.label(RichText::new(text).color(p.text_weak));
@@ -294,7 +295,8 @@ impl DnsApp {
                     ui.add_space(30.0);
                     if b.can_fix() {
                         let label = if b.running { format!("Закрыть {} и исправить", b.name) } else { format!("Исправить {}", b.name) };
-                        if ui.button(label).clicked() {
+                        let busy = self.fixing_browsers.contains(b.name);
+                        if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
                             self.fix_browser(&ctx, &b);
                         }
                         if let Some((ok, note)) = self.browser_note.get(b.name) {

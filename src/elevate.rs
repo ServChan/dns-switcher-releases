@@ -77,6 +77,21 @@ impl Drop for GuiLock {
     }
 }
 
+/// Один мастер установки за раз: два одновременных мастера мешали бы друг другу
+/// копировать файлы и создавать задания. None — мастер уже открыт.
+pub fn setup_lock() -> Option<GuiLock> {
+    let name = wide("Local\\DnsSwitcherSetup");
+    let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if h.is_null() {
+        return None;
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(h) };
+        return None;
+    }
+    Some(GuiLock(h))
+}
+
 /// `wait`: окно перезапускается с правами администратора, а старая копия
 /// ещё закрывается, поэтому ждём её до пяти секунд.
 pub fn single_instance(wait: bool) -> Option<GuiLock> {

@@ -13,21 +13,145 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE};
 
+/// Папки Windows спрашиваются у самой системы, а не берутся из переменных
+/// окружения: переменные пользователь может переопределить в своём реестре
+/// (HKCU\Environment), и они попадут в процесс, запущенный с правами администратора.
+fn api_dir(f: unsafe extern "system" fn(windows_sys::core::PWSTR, u32) -> u32, fallback: &str) -> PathBuf {
+    let mut buf = [0u16; 512];
+    let n = unsafe { f(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return PathBuf::from(fallback);
+    }
+    PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+}
+
+pub fn system_dir() -> PathBuf {
+    api_dir(windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW, r"C:\Windows\System32")
+}
+
 fn windows_dir() -> PathBuf {
-    std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+    api_dir(windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW, r"C:\Windows")
+}
+
+#[derive(Clone, Copy)]
+pub enum Folder {
+    ProgramFiles,
+    ProgramFilesX86,
+    ProgramData,
+    PublicDesktop,
+    CommonPrograms,
+    RoamingAppData,
+    LocalAppData,
+}
+
+/// Известная папка Windows (SHGetKnownFolderPath).
+pub fn known_folder(f: Folder) -> Option<PathBuf> {
+    use windows_sys::Win32::UI::Shell::*;
+    let id = match f {
+        Folder::ProgramFiles => FOLDERID_ProgramFiles,
+        Folder::ProgramFilesX86 => FOLDERID_ProgramFilesX86,
+        Folder::ProgramData => FOLDERID_ProgramData,
+        Folder::PublicDesktop => FOLDERID_PublicDesktop,
+        Folder::CommonPrograms => FOLDERID_CommonPrograms,
+        Folder::RoamingAppData => FOLDERID_RoamingAppData,
+        Folder::LocalAppData => FOLDERID_LocalAppData,
+    };
+    let mut out: windows_sys::core::PWSTR = std::ptr::null_mut();
+    let hr = unsafe { SHGetKnownFolderPath(&id, 0, std::ptr::null_mut(), &mut out) };
+    let path = (hr >= 0 && !out.is_null()).then(|| {
+        let len = (0..).take_while(|&i| unsafe { *out.add(i) } != 0).count();
+        PathBuf::from(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(out, len) }))
+    });
+    unsafe { windows_sys::Win32::System::Com::CoTaskMemFree(out as *const _) };
+    path
+}
+
+/// Путь — ссылка (символическая или junction), а не обычная папка или файл.
+pub fn is_reparse_point(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_attributes() & 0x400 != 0)
+}
+
+/// Владелец — администраторы или система: обычный пользователь эту папку не создавал.
+pub fn owned_by_admins(path: &Path) -> bool {
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{IsWellKnownSid, OWNER_SECURITY_INFORMATION, WinBuiltinAdministratorsSid, WinLocalSystemSid};
+    let name: Vec<u16> = path.as_os_str().encode_wide_z();
+    let mut owner = std::ptr::null_mut();
+    let mut sd = std::ptr::null_mut();
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    let ok = rc == 0
+        && !owner.is_null()
+        && unsafe { IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0 || IsWellKnownSid(owner, WinLocalSystemSid) != 0 };
+    if !sd.is_null() {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(sd) };
+    }
+    ok
+}
+
+trait WideZ {
+    fn encode_wide_z(&self) -> Vec<u16>;
+}
+
+impl WideZ for std::ffi::OsStr {
+    fn encode_wide_z(&self) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        self.encode_wide().chain(std::iter::once(0)).collect()
+    }
+}
+
+/// Пользователь, который сидит за этим сеансом Windows (ДОМЕН\имя). При вводе
+/// пароля чужой учётной записи администратора в окне UAC процесс работает от неё,
+/// а сеанс остаётся за обычным пользователем.
+pub fn session_user() -> Option<String> {
+    use windows_sys::Win32::System::RemoteDesktop::*;
+    let query = |class| -> Option<String> {
+        let mut buf: windows_sys::core::PWSTR = std::ptr::null_mut();
+        let mut bytes = 0u32;
+        let ok = unsafe { WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, class, &mut buf, &mut bytes) } != 0;
+        if !ok || buf.is_null() {
+            return None;
+        }
+        let len = (0..).take_while(|&i| unsafe { *buf.add(i) } != 0).count();
+        let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(buf, len) });
+        unsafe { WTSFreeMemory(buf as *mut _) };
+        Some(text)
+    };
+    let user = query(WTSUserName).filter(|u| !u.is_empty())?;
+    let domain = query(WTSDomainName).unwrap_or_default();
+    Some(if domain.is_empty() { user } else { format!("{domain}\\{user}") })
+}
+
+/// Пользователь, от имени которого работает этот процесс (ДОМЕН\имя).
+pub fn process_user() -> Option<String> {
+    use windows_sys::Win32::Security::Authentication::Identity::{GetUserNameExW, NameSamCompatible};
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    let ok = unsafe { GetUserNameExW(NameSamCompatible, buf.as_mut_ptr(), &mut len) };
+    ok.then(|| String::from_utf16_lossy(&buf[..len as usize]))
 }
 
 /// Полный путь к утилите Windows. По голому имени Windows сначала ищет exe рядом
 /// с запущенной программой: подложенный туда «taskkill.exe» получил бы права
 /// администратора. Поэтому системные утилиты вызываются только по полному пути.
 pub fn tool(name: &str) -> PathBuf {
-    let dir = windows_dir();
     match name {
-        "powershell" => dir.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
-        "explorer" => dir.join("explorer.exe"),
+        "powershell" => system_dir().join(r"WindowsPowerShell\v1.0\powershell.exe"),
+        "explorer" => windows_dir().join("explorer.exe"),
         other => {
             let file = if other.ends_with(".exe") { other.to_string() } else { format!("{other}.exe") };
-            dir.join("System32").join(file)
+            system_dir().join(file)
         }
     }
 }
@@ -172,6 +296,15 @@ mod tests {
             assert!(p.is_absolute(), "{name}: {}", p.display());
             assert!(p.exists(), "{name}: {}", p.display());
         }
+    }
+
+    #[test]
+    fn known_folders_resolve() {
+        let pf = known_folder(Folder::ProgramFiles).unwrap();
+        assert!(pf.is_absolute() && pf.exists(), "{}", pf.display());
+        assert!(known_folder(Folder::ProgramData).unwrap().exists());
+        assert!(owned_by_admins(&known_folder(Folder::ProgramData).unwrap()), "ProgramData принадлежит системе");
+        assert!(!owned_by_admins(&std::env::temp_dir()), "временная папка пользователя — его собственная");
     }
 
     #[test]

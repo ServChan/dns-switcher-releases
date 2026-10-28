@@ -46,12 +46,32 @@ pub struct Outcome {
     pub result: Result<Vec<String>, String>,
 }
 
-pub fn run(action: &Action, adapters: &[Adapter]) -> Vec<Outcome> {
-    // Окно и защита от сбоев могут менять DNS одновременно, в том числе из разных
-    // процессов (фоновое задание): выполняем по очереди под общим мьютексом.
+/// Право менять DNS. Окно и защита от сбоев могут менять его одновременно, в том
+/// числе из разных процессов (фоновое задание) и разных сеансов Windows, поэтому
+/// «проверить состояние → применить → записать состояние» делается под этим замком.
+pub struct Lock {
+    _local: std::sync::MutexGuard<'static, ()>,
+    _cross: ApplyLock,
+}
+
+pub fn lock() -> Result<Lock, String> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _cross = ApplyLock::take();
+    let local = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !crate::elevate::is_admin() {
+        return Err("Нужны права администратора: без них DNS не изменить.".into());
+    }
+    let cross = ApplyLock::take().ok_or("DNS сейчас меняет другая копия программы. Повторите через минуту.")?;
+    Ok(Lock { _local: local, _cross: cross })
+}
+
+pub fn run(action: &Action, adapters: &[Adapter]) -> Vec<Outcome> {
+    match lock() {
+        Ok(l) => run_locked(&l, action, adapters),
+        Err(e) => adapters.iter().map(|a| Outcome { adapter: a.name.clone(), result: Err(e.clone()) }).collect(),
+    }
+}
+
+pub fn run_locked(_lock: &Lock, action: &Action, adapters: &[Adapter]) -> Vec<Outcome> {
     let mut outcomes: Vec<Outcome> = adapters
         .iter()
         .map(|a| Outcome {
@@ -116,11 +136,12 @@ fn apply(adapter: &Adapter, server: &DnsServer, use_doh: bool, safety_net: bool)
 
     let v4: Vec<String> = chain.iter().flat_map(|s| s.ipv4.iter().cloned()).collect();
     let v6: Vec<String> = chain.iter().flat_map(|s| s.ipv6.iter().cloned()).collect();
-    set_family(adapter.index, "ipv4", &v4)?;
+    warnings.extend(set_family(adapter.index, "ipv4", &v4)?);
     if adapter.ipv6_index != 0 {
         // IPv4 уже стоит, поэтому сбой здесь только предупреждение.
-        if let Err(e) = set_family(adapter.ipv6_index, "ipv6", &v6) {
-            warnings.push(format!("IPv6-адреса DNS не изменены: {e}"));
+        match set_family(adapter.ipv6_index, "ipv6", &v6) {
+            Ok(w) => warnings.extend(w),
+            Err(e) => warnings.push(format!("IPv6-адреса DNS не изменены: {e}")),
         }
     }
     Ok(warnings)
@@ -138,10 +159,12 @@ fn reset(adapter: &Adapter) -> Result<(), String> {
 }
 
 /// Задаёт список серверов одного семейства. Пустой список возвращает DHCP.
-fn set_family(index: u32, family: &str, ips: &[String]) -> Result<(), String> {
+/// Основной адрес обязателен; если не добавился запасной, это предупреждение:
+/// подключение уже работает через основной.
+fn set_family(index: u32, family: &str, ips: &[String]) -> Result<Vec<String>, String> {
     let name = format!("name={index}");
     let Some((first, rest)) = ips.split_first() else {
-        return netsh(&["interface", family, "set", "dnsservers", &name, "source=dhcp"]);
+        return netsh(&["interface", family, "set", "dnsservers", &name, "source=dhcp"]).map(|_| Vec::new());
     };
     netsh(&[
         "interface",
@@ -154,8 +177,9 @@ fn set_family(index: u32, family: &str, ips: &[String]) -> Result<(), String> {
         "register=primary",
         "validate=no",
     ])?;
+    let mut warnings = Vec::new();
     for (i, ip) in rest.iter().enumerate() {
-        netsh(&[
+        if let Err(e) = netsh(&[
             "interface",
             family,
             "add",
@@ -164,9 +188,11 @@ fn set_family(index: u32, family: &str, ips: &[String]) -> Result<(), String> {
             &format!("address={ip}"),
             &format!("index={}", i + 2),
             "validate=no",
-        ])?;
+        ]) {
+            warnings.push(format!("запасной адрес {ip} не добавлен: {e}"));
+        }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 fn enable_doh(adapter: &Adapter, server: &DnsServer) -> Result<(), String> {
@@ -217,18 +243,19 @@ fn clear_doh_flags(guid: &str) {
 }
 
 /// Мьютекс на время смены DNS, общий для окна и фонового задания.
-struct ApplyLock(windows_sys::Win32::Foundation::HANDLE);
+pub struct ApplyLock(windows_sys::Win32::Foundation::HANDLE);
 
 impl ApplyLock {
     fn take() -> Option<Self> {
         use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
-        let name: Vec<u16> = "Local\\DnsSwitcherApply".encode_utf16().chain(std::iter::once(0)).collect();
+        // Global: DNS общий для всего компьютера, а защита может работать в разных сеансах.
+        let name: Vec<u16> = "Global\\DnsSwitcherApply".encode_utf16().chain(std::iter::once(0)).collect();
         let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         if h.is_null() {
             return None;
         }
         // WAIT_ABANDONED (процесс-владелец завершился) тоже отдаёт мьютекс нам.
-        let r = unsafe { WaitForSingleObject(h, 60_000) };
+        let r = unsafe { WaitForSingleObject(h, 120_000) };
         if r == 0 || r == 0x80 {
             Some(ApplyLock(h))
         } else {

@@ -60,15 +60,19 @@ fn add_icon(hwnd: HWND) {
     unsafe { Shell_NotifyIconW(NIM_ADD, &d) };
 }
 
-/// Показывает значок в отдельном потоке. Повторный вызов ничего не делает.
+/// Поток значка, если он запущен.
+static THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
+
+/// Показывает значок в отдельном потоке. Повторный вызов, пока значок есть, ничего не делает.
 pub fn start(tip: &str) {
-    if HWND_VALUE.load(Ordering::Relaxed) != 0 {
+    let mut thread = THREAD.lock().unwrap_or_else(|e| e.into_inner());
+    if thread.as_ref().is_some_and(|h| !h.is_finished()) {
         return;
     }
     if let Ok(mut t) = TIP.lock() {
         *t = tip.to_string();
     }
-    std::thread::spawn(|| unsafe {
+    *thread = Some(std::thread::spawn(|| unsafe {
         let class = wide("DnsSwitcherTray");
         let instance = GetModuleHandleW(std::ptr::null());
         let mut wc: WNDCLASSW = std::mem::zeroed();
@@ -111,15 +115,28 @@ pub fn start(tip: &str) {
             DispatchMessageW(&msg);
         }
         HWND_VALUE.store(0, Ordering::Relaxed);
-    });
+    }));
 }
 
-/// Убирает значок (защиту остановили).
+/// Убирает значок (защиту остановили) и ждёт, пока поток значка завершится:
+/// иначе следующий `start` принял бы уходящий значок за живой.
 pub fn stop() {
-    let h = hwnd();
-    if !h.is_null() {
-        unsafe { PostMessageW(h, WM_CLOSE, 0, 0) };
+    let Some(handle) = THREAD.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let mut posted = false;
+    for _ in 0..60 {
+        if handle.is_finished() {
+            let _ = handle.join();
+            return;
+        }
+        let h = hwnd();
+        if !h.is_null() && !posted {
+            unsafe { PostMessageW(h, WM_CLOSE, 0, 0) };
+            posted = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    // Поток не закрылся за 3 секунды: не ждём его, иначе защита не отпустила бы
+    // слежение. Значок уберёт Windows вместе с процессом.
 }
 
 /// Обновляет подсказку при наведении на значок.

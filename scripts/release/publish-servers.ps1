@@ -44,7 +44,6 @@ if ($LASTEXITCODE -ne 0) { throw "не удалось получить $Repo (gh
 try {
     # Программа берёт список с ветки main; в пустом репозитории её ещё нет.
     git -C $work checkout -B main 2>&1 | Out-Null
-    Set-Content -Path "$work\.gitattributes" -Value '* -text' -NoNewline -Encoding ascii
     Copy-Item -Force $list "$work\servers.json"
     Copy-Item -Force $sig "$work\servers.json.sig"
     git -C $work add servers.json servers.json.sig

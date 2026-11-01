@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "name": "GeoHide EU",
+      "ipv4": ["143.20.64.192", "45.13.237.213", "37.221.93.128"],
+      "ipv6": [],
+      "doh": "https://eu.geohide.ru/dns-query",
+      "ai_bypass": true,
+      "doh_only": false,
+      "note": "eu.geohide.ru. DNS и прокси в Европе: Gemini, AI Studio, NotebookLM, ChatGPT."
+    },
+    {
+      "name": "MagicDNS",
+      "ipv4": ["109.120.132.43", "94.249.177.102"],
+      "ipv6": [],
+      "doh": "https://dns.magicdns.ru/dns-query",
+      "ai_bypass": true,
+      "doh_only": false,
+      "note": "magicdns.ru. Claude, Gemini, ChatGPT, Perplexity, Cursor и ещё 30+ сервисов."
+    },
+    {
+      "name": "dns-ai",
+      "ipv4": ["194.87.196.13", "45.151.102.219"],
+      "ipv6": ["2a00:b700:5::3:62", "2a12:5940:d4ef::219"],
+      "doh": "https://dns.dns-ai.ru/dns-query",
+      "ai_bypass": true,
+      "doh_only": true,
+      "note": "dns-ai.ru. Только зашифрованный DNS: обычный порт 53 не отвечает."
+    },
+    {
+      "name": "GeoHide US",
+      "ipv4": ["192.255.159.240", "192.255.159.241"],
+      "ipv6": [],
+      "doh": "https://us.geohide.ru/dns-query",
+      "ai_bypass": true,
+      "doh_only": false,
+      "note": "us.geohide.ru. DNS и прокси в США. Часть прокси бывает недоступна."
+    },
+    {
+      "name": "Comss DNS",
+      "ipv4": ["83.220.169.155", "212.109.195.93"],
+      "ipv6": [],
+      "doh": "https://dns.comss.one/dns-query",
+      "ai_bypass": true,
+      "doh_only": false,
+      "note": "comss.one. ChatGPT и другие ИИ-сервисы, блокировка рекламы и трекеров."
+    },
+    {
+      "name": "Xbox-DNS",
+      "ipv4": ["111.88.96.54", "111.88.96.55"],
+      "ipv6": ["2a00:ab00:1233:26::50", "2a00:ab00:1233:26::51"],
+      "doh": "https://xbox-dns.ru/dns-query",
+      "ai_bypass": true,
+      "doh_only": false,
+      "note": "xbox-dns.ru. Xbox Live, игры, ChatGPT, Claude, Gemini, Copilot."
+    },
+    {
+      "name": "AdGuard DNS",
+      "ipv4": ["94.140.14.14", "94.140.15.15"],
+      "ipv6": ["2a10:50c0::ad1:ff", "2a10:50c0::ad2:ff"],
+      "doh": "https://dns.adguard-dns.com/dns-query",
+      "ai_bypass": false,
+      "doh_only": false,
+      "note": "Блокирует рекламу и трекеры."
+    },
+    {
+      "name": "Google Public DNS",
+      "ipv4": ["8.8.8.8", "8.8.4.4"],
+      "ipv6": ["2001:4860:4860::8888", "2001:4860:4860::8844"],
+      "doh": "https://dns.google/dns-query",
+      "ai_bypass": false,
+      "doh_only": false,
+      "note": ""
+    },
+    {
+      "name": "Cloudflare",
+      "ipv4": ["1.1.1.1", "1.0.0.1"],
+      "ipv6": ["2606:4700:4700::1111", "2606:4700:4700::1001"],
+      "doh": "https://cloudflare-dns.com/dns-query",
+      "ai_bypass": false,
+      "doh_only": false,
+      "note": ""
+    }
+  ]
+}

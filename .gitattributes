@@ -1,1 +1,3 @@
 release/servers.json text eol=lf
+servers.json -text
+servers.json.sig -text

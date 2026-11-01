@@ -1,73 +1,74 @@
-# Переключатель DNS
+<p align="center"><img src="assets/icon.png" width="96" alt="DNS Switcher icon"></p>
 
-Программа для Windows 10/11: список DNS-серверов, применение и сброс в один щелчок,
-отдельная группа серверов для обхода региональных ограничений ИИ и защита от сбоев.
+# Переключатель DNS / DNS Switcher
 
-## Возможности
+[![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue?style=flat-square)](README.md)
+[![Rust](https://img.shields.io/badge/Rust-2024-orange?style=flat-square&logo=rust)](Cargo.toml)
+[![Release](https://img.shields.io/github/v/release/ServChan/dns-switcher?style=flat-square)](https://github.com/ServChan/dns-switcher/releases/latest)
+[![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 
-- **Простой режим** для неопытных: одна карточка «всё ли работает» со схемой цепочки
-  «Компьютер → Браузер → DNS → Прокси → ИИ-сервисы», кнопка «Подобрать лучший сервер»
-  и раздел «Как это работает» со схемами. **Подробный режим**: весь список, ручной выбор,
-  проверка каждого адреса и прокси.
-- Стартовый список в `release/servers.json`: GeoHide EU, MagicDNS, dns-ai, GeoHide US,
-  Comss DNS, Xbox-DNS (для ИИ, порядок задаёт очередь резерва), AdGuard DNS, Google
-  Public DNS, Cloudflare (обычные).
-- Шифрование DoH (Windows 11): шаблон в `netsh dns encryption`, для адаптера режим
-  «только зашифрованные», как в «Параметрах».
-- Проверка сервера до самого сервиса: DNS по UDP или DoH (HTTP/2, HTTP/1.1), затем
-  TLS-соединение с прокси, которые сервер выдал для выбранных сервисов (ChatGPT, Gemini,
-  Claude, AI Studio, NotebookLM, Copilot, Perplexity и свои). Сверка с эталонным DNS
-  показывает, подменяет ли сервер адрес на самом деле, и ловит утечку через IPv6.
-- Сквозная проверка через саму Windows: доходят ли ответы выбранного сервера до системы
-  или она ушла на запасные адреса.
-- Браузеры со своим защищённым DNS (Chrome, Chromium, Edge, Яндекс, Brave, Opera,
-  Opera GX, Comet, Vivaldi, Firefox): находит и исправляет, закрывая и снова открывая
-  браузер. Процессы различаются по пути к exe, поэтому Chrome и Chromium не путаются.
-- Защита от сбоев: после двух плохих проверок подряд — переключение на лучший по
-  проверке сервер, при равенстве более надёжный по истории, затем выше в списке; затем
-  обычные DNS и DNS от роутера. Возврат к выбранному серверу. Страховка Cloudflare и
-  Google последними адресами. Фоновая защита через Планировщик, значок в области
-  уведомлений и уведомления Windows. Журнал: `%APPDATA%\DnsSwitcher\events.log`.
-- Обновления: раз в день подписанный список серверов (меняет только стандартные
-  серверы, которые вы не правили) и проверка новой версии с установкой по кнопке.
-  Всё скачанное проверяется подписью ed25519.
+Windows 10/11 app that keeps a list of DNS servers, applies or resets one in a single click, and falls back safely when a server stops working.
 
-## Выпуски
+**Руководство / User guide:** [Русский](docs/USER_GUIDE_RU.md) · [English](docs/USER_GUIDE_EN.md)
 
-Ключ подписи создаётся один раз: `scripts\release\new-updater-key.ps1` (закрытый ключ
-в диспетчере учётных данных, открытый в `assets\updater.pub`, встраивается при сборке).
-Выпуск: `scripts\release\publish.ps1 -Notes "..." -Publish`. Список серверов: поднять
-`version` в `release\servers.json`, затем `scripts\release\publish-servers.ps1 -Publish`.
-Репозиторий выпусков: `ServChan/dns-switcher-releases` (публичный).
+**Скачать / Download:** [DnsSwitcher-Setup.exe](https://github.com/ServChan/dns-switcher/releases/latest)
 
-## Установка
+## Русский
 
-`DnsSwitcher-Setup.exe` при запуске не из папки установки открывает мастер:
-начало, параметры (папка, ярлыки, запуск без UAC, фоновая защита), ход установки
-по шагам с кнопкой «Повторить» и итог с тем, что было настроено. Если программа
-уже стоит, мастер предлагает обновить её или удалить. Удаление из «Параметры →
-Приложения» запускает тот же мастер (`dns-switcher.exe --uninstall`): можно сразу
-вернуть DNS на автоматический и удалить настройки.
+### Что это
 
-Программе нужны права администратора, она запрашивает их сама при запуске.
-С настройкой «Открывать без запроса прав администратора» установщик создаёт
-задание «DnsSwitcher Launcher», и ярлык открывает программу сразу, без окна UAC.
-Окно программы открывается в одном экземпляре: повторный запуск выводит его вперёд.
+Программа для Windows 10/11: список DNS-серверов, применение и сброс в один щелчок, отдельная группа серверов для обхода региональных ограничений ИИ и защита от сбоев.
 
-## Сборка
+### Возможности
+
+- **Простой режим**: одна карточка «всё ли работает», цепочка «Компьютер → Браузер → DNS → Прокси → ИИ-сервисы» и кнопка «Подобрать лучший сервер». **Подробный режим**: весь список, ручной выбор, проверка каждого адреса и прокси.
+- **Шифрование DoH** (Windows 11): шаблон в `netsh dns encryption`, для адаптера режим «только зашифрованные».
+- **Проверка до самого сервиса**: DNS по UDP или DoH, затем TLS-соединение с прокси для ChatGPT, Gemini, Claude, AI Studio, NotebookLM, Copilot, Perplexity и своих сервисов. Сверка с эталонным DNS показывает, подменяет ли сервер адрес, и ловит утечку через IPv6.
+- **Сквозная проверка через Windows**: доходят ли ответы выбранного сервера до системы.
+- **Браузеры со своим защищённым DNS** (Chrome, Chromium, Edge, Яндекс, Brave, Opera, Opera GX, Comet, Vivaldi, Firefox): находит и исправляет.
+- **Защита от сбоев**: после двух плохих проверок подряд переключается на лучший сервер, затем на обычные DNS и DNS от роутера, а потом возвращается к выбранному. Работает в фоне через Планировщик, со значком и уведомлениями.
+- **Обновления**: раз в день подписанный список серверов и проверка новой версии. Всё скачанное проверяется подписью ed25519.
+
+### Установка
+
+Скачайте `DnsSwitcher-Setup.exe` из [выпусков](https://github.com/ServChan/dns-switcher/releases/latest) и запустите. Мастер предложит папку, ярлыки, запуск без запроса UAC и фоновую защиту. Программе нужны права администратора.
+
+### Сборка
 
 ```
 cargo build --release
 ```
 
-Результат: `target\release\dns-switcher.exe` (он же установщик).
-Значок перерисовывается скриптом `python tools/make_icon.py`.
+Результат: `target\release\dns-switcher.exe` (он же установщик). Значок перерисовывается скриптом `python tools/make_icon.py`. Проверка серверов на живой сети: `cargo test -- --ignored --nocapture`. Выпуск и отладочные режимы описаны в [руководстве](docs/USER_GUIDE_RU.md#для-разработки).
 
-Отладочная сборка не запрашивает права администратора.
-В ней `DNS_SWITCHER_DEBUG_INSTALLER=1` открывает мастер установки
-(`DNS_SWITCHER_DEBUG_PAGE=options|progress|failed|finish|update|uninstall` выбирает страницу),
-`DNS_SWITCHER_DEBUG_THEME=light` включает светлую тему,
-`DNS_SWITCHER_DEBUG_DIALOG=failover|log|editor|confirm` открывает диалог.
+## English
 
-Проверка серверов на живой сети:
-`cargo test -- --ignored --nocapture`.
+### What It Is
+
+A Windows 10/11 app with a list of DNS servers, one-click apply and reset, a dedicated group of servers for getting around regional restrictions on AI services, and failure protection.
+
+### Features
+
+- **Simple mode**: one "is everything working" card, the Computer → Browser → DNS → Proxy → AI services chain, and a "Find the best server" button. **Advanced mode**: the full list, manual selection, a check of every address and proxy.
+- **DoH encryption** (Windows 11): a template in `netsh dns encryption` and "encrypted only" mode for the adapter.
+- **Checks reach the service itself**: DNS over UDP or DoH, then a TLS connection to the proxies for ChatGPT, Gemini, Claude, AI Studio, NotebookLM, Copilot, Perplexity and your own services. Comparison with a reference DNS shows whether a server really rewrites the address and catches IPv6 leaks.
+- **End-to-end check through Windows**: confirms that answers from the selected server reach the system.
+- **Browsers with their own secure DNS** (Chrome, Chromium, Edge, Yandex, Brave, Opera, Opera GX, Comet, Vivaldi, Firefox): detected and fixed.
+- **Failure protection**: after two bad checks in a row it moves to the best server, then to regular DNS and the router's DNS, and later returns to your choice. Runs in the background through Task Scheduler, with a tray icon and notifications.
+- **Updates**: a signed server list once a day and a check for new versions. Everything downloaded is verified with an ed25519 signature.
+
+### Installation
+
+Download `DnsSwitcher-Setup.exe` from [Releases](https://github.com/ServChan/dns-switcher/releases/latest) and run it. The wizard offers a folder, shortcuts, launching without a UAC prompt and background protection. The app needs administrator rights. The interface is in Russian.
+
+### Building
+
+```
+cargo build --release
+```
+
+Output: `target\release\dns-switcher.exe`, which is also the installer. Redraw the icon with `python tools/make_icon.py`. Live server checks: `cargo test -- --ignored --nocapture`. Releasing and debug modes are covered in the [guide](docs/USER_GUIDE_EN.md#for-developers).
+
+## Лицензия / License
+
+MIT, см. / see [LICENSE](LICENSE).

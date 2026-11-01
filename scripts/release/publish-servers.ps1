@@ -8,7 +8,7 @@
 # только список новее уже применённого.
 
 param(
-    [string]$Repo = 'ServChan/dns-switcher-releases',
+    [string]$Repo = 'ServChan/dns-switcher',
     [switch]$Publish
 )
 $ErrorActionPreference = 'Stop'
@@ -38,7 +38,7 @@ Write-Output "Подписан список версии $($json.version): $($js
 
 if (-not $Publish) { return }
 
-$work = Join-Path ([IO.Path]::GetTempPath()) ("dns-switcher-releases-" + [guid]::NewGuid())
+$work = Join-Path ([IO.Path]::GetTempPath()) ("dns-switcher-list-" + [guid]::NewGuid())
 gh repo clone $Repo $work -- --depth 1 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "не удалось получить $Repo (gh repo create $Repo --public, если его ещё нет)" }
 try {
@@ -47,7 +47,7 @@ try {
     Set-Content -Path "$work\.gitattributes" -Value '* -text' -NoNewline -Encoding ascii
     Copy-Item -Force $list "$work\servers.json"
     Copy-Item -Force $sig "$work\servers.json.sig"
-    git -C $work add .gitattributes servers.json servers.json.sig
+    git -C $work add servers.json servers.json.sig
     git -C $work commit -m "Список серверов, версия $($json.version)" | Out-Null
     git -C $work push -u origin main 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'не удалось отправить список' }

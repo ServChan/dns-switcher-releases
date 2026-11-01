@@ -16,9 +16,9 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const REPO: &str = "ServChan/dns-switcher-releases";
-const LIST_URL: &str = "https://raw.githubusercontent.com/ServChan/dns-switcher-releases/main/servers.json";
-const MANIFEST_URL: &str = "https://github.com/ServChan/dns-switcher-releases/releases/latest/download/latest.json";
+pub const REPO: &str = "ServChan/dns-switcher";
+const LIST_URL: &str = "https://raw.githubusercontent.com/ServChan/dns-switcher/main/servers.json";
+const MANIFEST_URL: &str = "https://github.com/ServChan/dns-switcher/releases/latest/download/latest.json";
 const PUBKEY: Option<&str> = option_env!("DNS_SWITCHER_UPDATER_PUBKEY");
 const TIMEOUT: Duration = Duration::from_secs(20);
 /// Как часто проверять обновления сами по себе.

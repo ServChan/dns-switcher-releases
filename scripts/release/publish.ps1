@@ -10,7 +10,7 @@
 param(
     [string]$Notes = '',
     [string]$NotesFile = '',
-    [string]$Repo = 'ServChan/dns-switcher-releases',
+    [string]$Repo = 'ServChan/dns-switcher',
     [switch]$Publish
 )
 $ErrorActionPreference = 'Stop'
